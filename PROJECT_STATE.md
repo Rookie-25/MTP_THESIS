@@ -1,7 +1,7 @@
 # PROJECT_STATE.md
 
 **Project:** GPU-Native Differentiable AAD Monte-Carlo XVA & Greeks Engine with Neural-SDE / Rough-Volatility Calibration
-**Last updated:** 2026-08-17
+**Last updated:** 2026-08-18
 
 ---
 
@@ -11,9 +11,11 @@
 
 **Phase 2 (Month 2) — Exposure Profiling, Collateral & CVA/DVA: COMPLETE.**
 
-**Phase 3 (Month 3) — Custom CUDA/Triton kernels: READY TO START, on Google Colab.**
+**Phase 3 (Month 3) — Custom Triton kernels: IN PROGRESS. Code written; GPU validation pending on Colab.**
 
-All Phase 2 deliverables are implemented, tested and benchmarked: exposure profiles (EE/ENE/PFE/EPE), collateralised exposure under a CSA (threshold, MTA, MPOR), unilateral CVA/DVA, end-to-end AAD sensitivities through the full chain, a manual inspection sandbox, and an empirical O(1)-vs-O(n) scaling benchmark. **74/74 tests passing.**
+All Phase 2 deliverables are implemented, tested and benchmarked: exposure profiles (EE/ENE/PFE/EPE), collateralised exposure under a CSA (threshold, MTA, MPOR), unilateral CVA/DVA, end-to-end AAD sensitivities through the full chain, a manual inspection sandbox, and an empirical O(1)-vs-O(n) scaling benchmark.
+
+Phase 3 has a fused Triton GBM kernel with a hand-derived adjoint. **The adjoint mathematics is verified on CPU today; the kernels themselves are unverified and must be run on Colab before any claim is made about them.** Suite status: **101 passed, 27 skipped** — the 27 skips are the GPU tier, which cannot execute locally (no Triton wheel on Windows, no working CUDA device).
 
 ## Files created/modified
 
@@ -57,19 +59,34 @@ xva-cuda-engine/
 │   │                              #   compute_xva -> XVAResult, make_cva_valuation_fn (single-graph
 │   │                              #   GBM->MtM->EE->CVA closure), cva_aad_greeks,
 │   │                              #   cva_bump_and_revalue_greeks
-│   ├── csrc/__init__.py           # empty stub, Phase 3 target
+│   ├── csrc/                       # ---------- PHASE 3 ----------
+│   │   ├── __init__.py
+│   │   └── triton_gbm.py          # fused Triton GBM kernel + hand-written adjoint:
+│   │                              #   _fused_gbm_forward_kernel  (chunked time-axis scan with
+│   │                              #     running carry; increment scale + cumsum + exp + S0 fused)
+│   │                              #   _fused_gbm_backward_kernel (reverse chunk walk building the
+│   │                              #     suffix sum via total-minus-prefix; per-program partial
+│   │                              #     buffers reduced host-side for bitwise determinism)
+│   │                              #   reference_gbm_backward     (pure-PyTorch transcription of the
+│   │                              #     same adjoint -- CPU-testable AND double-differentiable)
+│   │                              #   FusedGBMFunction (autograd.Function, once_differentiable)
+│   │                              #   triton_simulate_gbm (drop-in for simulate_gbm)
+│   │                              #   select_block_sizes, is_available, HAS_TRITON
 │   └── api/__init__.py            # empty stub, Phase 5 target
 ├── manual_sandbox.py               # interactive CLI inspection harness: nudge market/credit
 │                                   # params, print CVA + AAD Greeks, write sandbox_exposures.png
 ├── benchmarks/
-│   └── bench_phase2.py             # AAD O(1) vs FD O(n) scaling sweep, ASCII table + optional CSV
+│   ├── bench_phase2.py             # AAD O(1) vs FD O(n) scaling sweep, ASCII table + optional CSV
+│   └── bench_phase3.py             # fused-vs-PyTorch time + peak VRAM sweep; torch.cuda.Event
+│                                   # timing, max_memory_allocated, OOM captured as a result
 └── tests/
     ├── conftest.py                 # repo-root sys.path fallback, seeds torch, `device` fixture (cpu/cuda param)
     ├── test_phase1.py              # 15 tests, all passing
-    └── test_phase2.py              # 59 tests, all passing (33 core + 26 collateral/CSA)
+    ├── test_phase2.py              # 59 tests, all passing (33 core + 26 collateral/CSA)
+    └── test_phase3.py              # 54 tests: 27 CPU-tier passing, 27 GPU-tier skipped locally
 ```
 
-**Full suite: 74/74 passing** (`python -m pytest tests/ -q`, ~31s on CPU).
+**Full suite: 101 passed, 27 skipped** (`python -m pytest tests/ -q`, ~35s on CPU).
 
 ## Verified math / working components
 
@@ -125,6 +142,31 @@ xva-cuda-engine/
 
 **Over a 10× increase in risk factors, AAD wall time grew 0.94× (i.e. flat) while FD grew 8.45×.** The `AAD/fwd` column holds at ~2.0–2.7× — squarely inside the 2–5× constant that reverse-mode theory predicts, and independent of `n`. `forward (ms)` also stays flat, confirming the multi-factor mock adds risk factors without inflating the simulation, so the comparison is fair. Both methods agree to ~1e-6 throughout, so the timing comparison is between two methods that actually produce the same answer.
 
+### Phase 3 — fused Triton kernel (new, PARTIALLY VERIFIED)
+
+**Verified on CPU today (27 tests passing):**
+
+- **The adjoint derivation is correct.** `reference_gbm_backward` — a pure-PyTorch transcription of exactly the formulas the Triton kernel implements — matches `torch.autograd` to `rel_tol=1e-11` on shapes `(1,1)`, `(1,8)`, `(7,3)`, `(64,252)`. This is the hard part of the phase and it is *done*, independent of any GPU.
+- **The Ito correction in Vega is guarded by a dedicated test.** `∂ι/∂σ = ΔW − σΔt`; the second term is the most plausible thing to drop, and `test_vega_ito_correction_is_present` asserts the naive `ΔW`-only version differs, and that the discrepancy equals exactly `σΔt·ΣQ`.
+- **The reference adjoint is double-differentiable**, so second-order work (Gamma, Hessian-vector products) has a validated fallback that the kernel path cannot provide.
+- **Block-size heuristics**: `BLOCK_M`/`BLOCK_N` always powers of two, tile always ≤ 32 KiB SRAM budget, float64 tiles no larger than float32 tiles.
+- **Graceful degradation**: the module imports cleanly with no Triton installed (stub `triton`/`tl` objects), so the CPU suite keeps collecting; calling the fused path raises an actionable `RuntimeError`.
+
+**NOT yet verified — requires Colab:**
+
+- The forward kernel's chunked scan (masking, carry propagation, stride handling).
+- The backward kernel's reverse chunk walk and partial-buffer reduction.
+- `gradcheck`, forward/backward parity vs PyTorch, determinism, non-contiguous input handling, and the end-to-end CVA-Greeks parity test.
+- **No performance number has been measured.** `bench_phase3.py` has never executed. Do not quote a speedup or memory saving until it has.
+
+**Design decisions worth recording:**
+
+- **Determinism over speed in the reduction.** Scalar gradients use per-program partial buffers summed in PyTorch, *not* `tl.atomic_add`. Atomics make the result depend on program completion order, so two runs could differ in the last bits — unacceptable when validating against a finite-difference oracle, and float64 atomic support in Triton is patchy anyway.
+- **Suffix sum without a reverse-scan primitive.** The backward uses `suffix[j] = chunk_total − inclusive_prefix[j] + P[j]`, needing only forward `cumsum`/`sum`. Avoids depending on `tl.flip`, which is not in every Triton version.
+- **Scalars passed as a device tensor, not JIT scalar args.** Python floats get demoted to float32 by Triton, silently destroying float64 precision. Packing `[s0, mu, sigma, dt]` into a device tensor also avoids a host sync per call (which would otherwise show up in the benchmark).
+- **`from __future__ import annotations` deliberately omitted** in `triton_gbm.py`: Triton inspects `tl.constexpr` annotations as live objects, and postponed (string) annotations would silently demote compile-time constants to runtime arguments.
+- **No double backward** (`once_differentiable`). Raises rather than returning silent garbage. The PyTorch path retains double-backward support.
+
 ## Known bugs / technical blockers
 
 1. **BLOCKER #1 — BYPASSED, not fixed. Local GPU unusable; Phase 3 moves to Google Colab.** `Get-PnpDevice` on the RTX 3050 Laptop GPU reports `CM_PROB_FAILED_POST_START`; `nvidia-smi` fails with a permissions error; `torch.cuda.device_count() == 0` even though PyTorch 2.4.0+cu121 is CUDA-built (`torch.backends.cuda.is_built() == True`) and `nvcuda.dll` loads fine. This is an NVIDIA driver/device fault, not a PyTorch install issue.
@@ -146,9 +188,13 @@ xva-cuda-engine/
 
 ## Next immediate task for the upcoming session
 
-**Phase 3 — custom CUDA/Triton kernels for the SDE hot path, on Google Colab.**
+**Validate the Phase 3 kernels on Colab. Nothing else in Phase 3 can be trusted until this is done.**
 
-Session-zero bootstrap (do this first, it is the only new thing):
+1. Bootstrap Colab (see below), then run `python -m pytest tests/test_phase3.py -v`. The 27 currently-skipped GPU tests must run and pass. Expect to iterate — the kernels have never executed. Most likely failure points, in order: `tl.cumsum` axis semantics on the 2-D tile, the `range(0, n_steps, BLOCK_N)` dynamic loop bound, `tl.store` of a 0-d reduction into the partial buffers, and float64 support for `tl.exp`.
+2. Only once the tests pass, run `python benchmarks/bench_phase3.py` and record the numbers. Do not put a speedup figure in the write-up before this.
+3. Then re-run the full suite on GPU (`python -m pytest tests/ -q`) to confirm nothing regressed.
+
+Colab bootstrap (prerequisite for all of the above):
 
 1. Get the repo onto Colab — either `git clone` (once it is pushed to a remote; **it is not currently a git repository**, so `git init` + push is a prerequisite) or mount Google Drive and sync the folder.
 2. Record the Colab environment: `torch.__version__`, `torch.version.cuda`, `nvidia-smi` output, GPU model. Pin these next to any benchmark number.
