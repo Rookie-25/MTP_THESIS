@@ -1,7 +1,7 @@
 # PROJECT_STATE.md
 
 **Project:** GPU-Native Differentiable AAD Monte-Carlo XVA & Greeks Engine with Neural-SDE / Rough-Volatility Calibration
-**Last updated:** 2026-08-19 (int64 addressing fix)
+**Last updated:** 2026-08-20 (Phase 5 fused reduction)
 
 ---
 
@@ -17,9 +17,11 @@ All Phase 2 deliverables are implemented, tested and benchmarked: exposure profi
 
 **Phase 4 (Month 3-4) — In-kernel Philox RNG + rematerialisation: IN PROGRESS. Code written; GPU validation pending on Colab.**
 
+**Phase 5 (Month 4) — Fused payoff/exposure reduction, O(N) memory: IN PROGRESS. Code written; GPU validation pending on Colab.**
+
 Phase 3 has a fused Triton GBM kernel with a hand-derived adjoint. Phase 4 removes the caller-supplied `dW` matrix entirely by generating increments in-kernel from a counter-based (Philox) RNG, and rematerialises them in the backward pass instead of storing them.
 
-**For both Phase 3 and Phase 4: the adjoint mathematics is verified on CPU today; the kernels themselves are unverified and must be run on Colab before any claim is made about them.** Suite status: **128 passed, 47 skipped** — the 47 skips are the GPU tier, which cannot execute locally (no Triton wheel on Windows, no working CUDA device).
+**For both Phase 3 and Phase 4: the adjoint mathematics is verified on CPU today; the kernels themselves are unverified and must be run on Colab before any claim is made about them.** Suite status: **175 passed, 65 skipped** — the 47 skips are the GPU tier, which cannot execute locally (no Triton wheel on Windows, no working CUDA device).
 
 ## Files created/modified
 
@@ -76,6 +78,14 @@ xva-cuda-engine/
 │   │                              #   FusedGBMFunction (autograd.Function, once_differentiable)
 │   │                              #   triton_simulate_gbm (drop-in for simulate_gbm)
 │   │                              #   select_block_sizes, is_available, HAS_TRITON
+│   │       triton_cva_fusion.py   # ---------- PHASE 5 ---------- fused O(N)-memory reduction:
+│   │                              #   _fused_exposure_forward_kernel  (paths->MtM->floor->reduce,
+│   │                              #     register accumulator, bounded grid-stride; NO path matrix)
+│   │                              #   _fused_exposure_backward_kernel (rematerialises Z AND paths)
+│   │                              #   build_affine_coefficients (portfolio -> B, C vectors)
+│   │                              #   select_fused_block_sizes, FusedExposureFunction
+│   │                              #   fused_expected_exposure, fused_cva
+│   │                              #   reference_fused_exposure[_backward] (CPU-testable)
 │   │       triton_philox_gbm.py   # ---------- PHASE 4 ---------- in-kernel RNG:
 │   │                              #   _philox_gbm_forward_kernel  (tl.randn in SRAM; NO dW ptr)
 │   │                              #   _philox_gbm_backward_kernel (rematerialises Z from the same
@@ -90,6 +100,8 @@ xva-cuda-engine/
 │   ├── bench_phase2.py             # AAD O(1) vs FD O(n) scaling sweep, ASCII table + optional CSV
 │   ├── bench_phase3.py             # fused-vs-PyTorch time + peak VRAM sweep; torch.cuda.Event
 │   │                               # timing, max_memory_allocated, OOM captured as a result
+│   ├── bench_phase5.py             # Phase 4 (materialised paths) vs Phase 5 (fused);
+│   │                               # M to 50M, pre-flight VRAM guard, O(N) memory evidence
 │   └── bench_phase4.py             # Phase 3 (dW in HBM) vs Phase 4 (in-kernel Philox);
 │                                   # M up to 20M, reports the OOM crossover + ceiling analysis
 └── tests/
@@ -97,10 +109,11 @@ xva-cuda-engine/
     ├── test_phase1.py              # 15 tests, all passing
     ├── test_phase2.py              # 59 tests, all passing (33 core + 26 collateral/CSA)
     ├── test_phase3.py              # 54 tests: 27 CPU-tier passing, 27 GPU-tier skipped locally
-    └── test_phase4.py              # 47 tests: 27 CPU-tier passing, 20 GPU-tier skipped locally
+    ├── test_phase4.py              # 57 tests: 37 CPU-tier passing, 20 GPU-tier skipped locally
+    └── test_phase5.py              # 54 tests: 37 CPU-tier passing, 18 GPU-tier skipped locally
 ```
 
-**Full suite: 128 passed, 47 skipped** (`python -m pytest tests/ -q`, ~41s on CPU).
+**Full suite: 175 passed, 65 skipped** (`python -m pytest tests/ -q`, ~32s on CPU).
 
 ## Verified math / working components
 
@@ -244,6 +257,42 @@ The first is statistical and silent; the second is fatal and immediate. They pul
 
 **Benchmark hardening (`bench_phase4.py`):** a pre-flight VRAM check now refuses any configuration needing more than 90% of *free* memory (`torch.cuda.mem_get_info`), reporting `OOM (pred)` plus what it would have needed, without launching. This matters beyond tidiness: an illegal memory access **poisons the CUDA context for the whole process and cannot be caught**, so one bad size would abort the entire sweep. `_reset_cuda()` now also synchronises before dropping the cache and clears accumulated stats, and the budget is re-read between backends.
 
+### Phase 5 — fused exposure reduction, O(N) memory (new, PARTIALLY VERIFIED)
+
+`src/csrc/triton_cva_fusion.py`, `tests/test_phase5.py` (54 tests: **37 CPU-tier passing**, 18 GPU-tier skipped), `benchmarks/bench_phase5.py`.
+
+**Verified on CPU today (37 tests passing):**
+
+- **The affine collapse is exact.** `V[m,k] = B[k]*S[m,k] - C[k]` reproduces `portfolio_swap_mtm` to 4e-14 across four portfolios (single-leg, two-leg netted, three-leg with staggered maturity, mixed-sign). Verified separately that `B[k]` equals `dV/dS` via autograd — that matters because `B` is exactly what the adjoint contracts against, so an error there would corrupt Delta and Vega while leaving the forward EE perfectly correct.
+- **The fused adjoint is correct.** `reference_fused_exposure_backward` matches autograd to `rel_tol=1e-10` on shapes `(1,1)`, `(3,4)`, `(17,9)`, `(256,64)`. This is a **third independent derivation** (Phase 3 used `dW`; Phase 4 used `sqrt(dt)*Z`; Phase 5 adds the exposure indicator, the `1/M`, and the `B[k]` factor).
+- **Loop closed:** `reference_fused_exposure` equals `expected_exposure(portfolio_swap_mtm(...))` to 1e-12 on identical normals. So the only thing left unverified is the kernel itself.
+- **Two specific bug-shapes locked in by dedicated tests:** the column-0 exclusion (including the non-existent increment at k=0 double-counts every path — the test asserts the buggy variant differs AND that the gap equals exactly the column-0 suffix term) and the Ito correction in Vega.
+- Exposure floor kills gradients exactly where out-of-the-money; single-tile block selection covers the time axis, fits the 32 KiB SRAM budget, and keeps the Philox counter inside int32; long horizons fail loudly naming the Phase 4 fallback.
+
+**NOT yet verified — requires Colab:** every kernel-level claim. The 18 GPU tests cover fused-vs-unfused EE/CVA agreement within sampling error, peak-memory independence of M, FD Greeks, grid-size invariance, and backward memory. **No performance or memory number has been measured.**
+
+**ARCHITECTURAL DECISIONS (logged)**
+
+1. **The affine collapse is what makes the fusion tractable.** A linear netting set of *any* size compresses to two length-(N+1) vectors: `B[k] = sum_i N_i*1{t<=T_i}*exp(-r(T_i-t))` and `C[k] = sum_i N_i*1{t<=T_i}*exp(-r(T_i-t))*K_i`. So the kernel signature is independent of portfolio size, and `dV/dS = B[k]` is a per-step constant identical across paths — which is what keeps the adjoint cheap.
+2. **DEVIATION FROM BRIEF: the CVA integral is NOT fused into the kernel.** It is O(N) (~252 multiply-adds), so fusing it buys nothing measurable while costing hand-written adjoints for lambda and R inside the kernel plus a second implementation of the same integral to keep consistent. The kernel stops at the EE profile; `fused_cva()` composes the credit integral in PyTorch using the already-verified Phase 2 `compute_unilateral_cva`. Consequences, all favourable: `dCVA/dlambda` and `dCVA/dR` come from autograd exactly with zero new kernel code; the fused EE composes with any downstream functional (DVA, PFE measures, the Phase 2 collateral machinery), not just one CVA formula; one source of truth. Callers still get `(ee, cva)` and every sensitivity.
+3. **Single time tile, not Phase 4's chunked scan.** The reverse suffix scan needs `S[m,k]` for *all* k simultaneously; re-deriving it chunk-by-chunk in reverse would cost O(N^2/BLOCK_N) work or an extra carry buffer. Price is a cap on N (~2500 daily steps in fp32, i.e. a ten-year horizon); beyond that `select_fused_block_sizes` raises and names `philox_simulate_gbm` as the O(M*N) fallback.
+4. **Bounded grid + register accumulator.** Peak is `n_programs*(N+1)*element_size` — the grid is capped (default 4096) and each program strides over path blocks with a `BLOCK_T`-wide register accumulator, so there is no per-block HBM traffic and no M term anywhere in the memory formula.
+5. **Philox keyed on the ABSOLUTE path-block index, not `program_id`.** An improvement on Phase 4, where the key was grid-coupled. Keying on the absolute block index makes the random stream reproducible regardless of how many programs launch, so forward and backward may use different grid sizes and still rematerialise identical draws. A GPU test asserts `max_programs=64` and `max_programs=4096` agree.
+6. **Both 32-bit hazards handled, in opposite directions** (as established in Phase 4): the Philox counter stays int32 and small (`BLOCK_M*(N+1)` <= ~16k), while every global pointer offset is promoted to int64.
+7. **Total Rho is REFUSED, not half-answered.** Discount factors are baked into the constant `B, C` before the kernel runs, so differentiating w.r.t. `rate` would silently return only the drift half. `fused_expected_exposure` raises if `rate` requires grad. Explicit refusal beats a silently partial Greek.
+8. **Non-linear payoffs out of scope.** A call MtM is not affine in S, so the `B*S - C` collapse does not apply.
+
+**HONEST SCOPE OF THE MEMORY CLAIM**
+
+| paths (fp32, N=252) | Phase 4 path matrix | Phase 5 partials |
+|---|---|---|
+| 1M | 0.94 GiB | ~4 MiB |
+| 5M | 4.71 GiB | ~4 MiB |
+| 10M | 9.42 GiB | ~4 MiB |
+| 50M | 47.13 GiB | ~4 MiB |
+
+The claim is **bounded by a constant, not bitwise identical across M**: the grid is `min(ceil(M/BLOCK_M), max_programs)`, so a *small* M launches fewer programs and uses slightly *less*. What must never happen is growth with M. 50M paths is unreachable for Phase 4 on any current single GPU and routine for Phase 5 on a 16 GiB card — that is the headline, and it is the first phase where the memory result is qualitative rather than a constant factor.
+
 ## Known bugs / technical blockers
 
 1. **BLOCKER #1 — BYPASSED, not fixed. Local GPU unusable; Phase 3 moves to Google Colab.** `Get-PnpDevice` on the RTX 3050 Laptop GPU reports `CM_PROB_FAILED_POST_START`; `nvidia-smi` fails with a permissions error; `torch.cuda.device_count() == 0` even though PyTorch 2.4.0+cu121 is CUDA-built (`torch.backends.cuda.is_built() == True`) and `nvcuda.dll` loads fine. This is an NVIDIA driver/device fault, not a PyTorch install issue.
@@ -268,10 +317,10 @@ The first is statistical and silent; the second is fatal and immediate. They pul
 **Validate the Phase 3 AND Phase 4 kernels on Colab. Nothing in either phase can be trusted until this is done.**
 
 1. Bootstrap Colab (see below), then `python -m pytest tests/test_phase3.py -v`. The 27 skipped GPU tests must run and pass. Expect to iterate — the kernels have never executed. Likely failure points, in order: `tl.cumsum` axis semantics on the 2-D tile, the `range(0, n_steps, BLOCK_N)` dynamic loop bound, `tl.store` of a 0-d reduction into the partial buffers, float64 `tl.exp`.
-2. Then `python -m pytest tests/test_phase4.py -v` (20 GPU tests). Additional Phase 4 failure points: the exact `tl.randn(seed, offset)` signature and whether it accepts a 2-D offset tile; whether `tl.randn` returns float32 (the `.to(DTYPE)` cast assumes it does); and whether `seed + pid` is accepted as a runtime scalar key.
+2. Then `python -m pytest tests/test_phase4.py -v` (20 GPU tests), then `tests/test_phase5.py -v` (18 GPU tests). Additional Phase 4 failure points: the exact `tl.randn(seed, offset)` signature and whether it accepts a 2-D offset tile; whether `tl.randn` returns float32 (the `.to(DTYPE)` cast assumes it does); and whether `seed + pid` is accepted as a runtime scalar key.
 3. **Run the moment tests before the gradient tests.** If the increments are not really `N(0, Δt)`, every gradient test is meaningless. `test_log_return_variance_matches_theory` is the sharpest single check — it would catch a missing `√Δt`.
 4. **If Vega fails FD while Delta and Rho pass, the bug is rematerialisation**, not the adjoint (the CPU tier already proved the formulas). Check that `BLOCK_M` and `seed` reaching the backward are identical to the forward's.
-5. Only once tests pass, run `python benchmarks/bench_phase3.py` then `python benchmarks/bench_phase4.py` and record the numbers. **Do not put any speedup or memory figure in the write-up before this.** Note `bench_phase4.py` defaults to M up to 20M, which needs ~19 GiB just for the output — on a T4/L4 expect OOM at 20M and possibly 10M; that is reported, not hidden. Use `--paths 1000000 5000000 10000000` on a smaller card.
+5. Only once tests pass, run `bench_phase3.py`, `bench_phase4.py`, then `bench_phase5.py` and record the numbers. Phase 5 likely failure points, additional to Phase 4's: `tl.num_programs`, the grid-stride `range(pid, n_blocks, n_programs)` with runtime bounds, `tl.maximum` on a 2-D tile, and whether a `BLOCK_T`-wide register accumulator survives the loop without spilling. **Do not put any speedup or memory figure in the write-up before this.** Note `bench_phase4.py` defaults to M up to 20M, which needs ~19 GiB just for the output — on a T4/L4 expect OOM at 20M and possibly 10M; that is reported, not hidden. Use `--paths 1000000 5000000 10000000` on a smaller card.
 6. Re-run the full suite on GPU (`python -m pytest tests/ -q`) to confirm nothing regressed.
 
 Colab bootstrap (prerequisite for all of the above):
