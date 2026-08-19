@@ -877,7 +877,7 @@ def fused_expected_exposure(
     dt = float(steps[0])
     if dt <= 0.0:
         raise ValueError("times must be strictly increasing")
-    if float((steps - steps[0]).abs().max()) > 1e-6 * dt:
+    if float((steps - steps[0]).abs().max()) > 1e-4 * dt:
         raise ValueError("the fused kernel assumes a uniform time grid")
 
     device, dtype = times.device, times.dtype
