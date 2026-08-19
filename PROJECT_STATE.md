@@ -1,7 +1,7 @@
 # PROJECT_STATE.md
 
 **Project:** GPU-Native Differentiable AAD Monte-Carlo XVA & Greeks Engine with Neural-SDE / Rough-Volatility Calibration
-**Last updated:** 2026-08-18
+**Last updated:** 2026-08-19
 
 ---
 
@@ -15,7 +15,11 @@
 
 All Phase 2 deliverables are implemented, tested and benchmarked: exposure profiles (EE/ENE/PFE/EPE), collateralised exposure under a CSA (threshold, MTA, MPOR), unilateral CVA/DVA, end-to-end AAD sensitivities through the full chain, a manual inspection sandbox, and an empirical O(1)-vs-O(n) scaling benchmark.
 
-Phase 3 has a fused Triton GBM kernel with a hand-derived adjoint. **The adjoint mathematics is verified on CPU today; the kernels themselves are unverified and must be run on Colab before any claim is made about them.** Suite status: **101 passed, 27 skipped** — the 27 skips are the GPU tier, which cannot execute locally (no Triton wheel on Windows, no working CUDA device).
+**Phase 4 (Month 3-4) — In-kernel Philox RNG + rematerialisation: IN PROGRESS. Code written; GPU validation pending on Colab.**
+
+Phase 3 has a fused Triton GBM kernel with a hand-derived adjoint. Phase 4 removes the caller-supplied `dW` matrix entirely by generating increments in-kernel from a counter-based (Philox) RNG, and rematerialises them in the backward pass instead of storing them.
+
+**For both Phase 3 and Phase 4: the adjoint mathematics is verified on CPU today; the kernels themselves are unverified and must be run on Colab before any claim is made about them.** Suite status: **128 passed, 47 skipped** — the 47 skips are the GPU tier, which cannot execute locally (no Triton wheel on Windows, no working CUDA device).
 
 ## Files created/modified
 
@@ -72,21 +76,31 @@ xva-cuda-engine/
 │   │                              #   FusedGBMFunction (autograd.Function, once_differentiable)
 │   │                              #   triton_simulate_gbm (drop-in for simulate_gbm)
 │   │                              #   select_block_sizes, is_available, HAS_TRITON
+│   │       triton_philox_gbm.py   # ---------- PHASE 4 ---------- in-kernel RNG:
+│   │                              #   _philox_gbm_forward_kernel  (tl.randn in SRAM; NO dW ptr)
+│   │                              #   _philox_gbm_backward_kernel (rematerialises Z from the same
+│   │                              #     (seed+pid, offset); no grad_dW, no stored Z)
+│   │                              #   reference_philox_forward/backward (CPU-testable, 2nd-order OK)
+│   │                              #   FusedPhiloxGBMFunction, philox_simulate_gbm
+│   │                              #   validate_offset_scheme, MAX_PHILOX_OFFSET (int32 alias guard)
 │   └── api/__init__.py            # empty stub, Phase 5 target
 ├── manual_sandbox.py               # interactive CLI inspection harness: nudge market/credit
 │                                   # params, print CVA + AAD Greeks, write sandbox_exposures.png
 ├── benchmarks/
 │   ├── bench_phase2.py             # AAD O(1) vs FD O(n) scaling sweep, ASCII table + optional CSV
-│   └── bench_phase3.py             # fused-vs-PyTorch time + peak VRAM sweep; torch.cuda.Event
-│                                   # timing, max_memory_allocated, OOM captured as a result
+│   ├── bench_phase3.py             # fused-vs-PyTorch time + peak VRAM sweep; torch.cuda.Event
+│   │                               # timing, max_memory_allocated, OOM captured as a result
+│   └── bench_phase4.py             # Phase 3 (dW in HBM) vs Phase 4 (in-kernel Philox);
+│                                   # M up to 20M, reports the OOM crossover + ceiling analysis
 └── tests/
     ├── conftest.py                 # repo-root sys.path fallback, seeds torch, `device` fixture (cpu/cuda param)
     ├── test_phase1.py              # 15 tests, all passing
     ├── test_phase2.py              # 59 tests, all passing (33 core + 26 collateral/CSA)
-    └── test_phase3.py              # 54 tests: 27 CPU-tier passing, 27 GPU-tier skipped locally
+    ├── test_phase3.py              # 54 tests: 27 CPU-tier passing, 27 GPU-tier skipped locally
+    └── test_phase4.py              # 47 tests: 27 CPU-tier passing, 20 GPU-tier skipped locally
 ```
 
-**Full suite: 101 passed, 27 skipped** (`python -m pytest tests/ -q`, ~35s on CPU).
+**Full suite: 128 passed, 47 skipped** (`python -m pytest tests/ -q`, ~41s on CPU).
 
 ## Verified math / working components
 
@@ -167,6 +181,46 @@ xva-cuda-engine/
 - **`from __future__ import annotations` deliberately omitted** in `triton_gbm.py`: Triton inspects `tl.constexpr` annotations as live objects, and postponed (string) annotations would silently demote compile-time constants to runtime arguments.
 - **No double backward** (`once_differentiable`). Raises rather than returning silent garbage. The PyTorch path retains double-backward support.
 
+### Phase 4 — in-kernel Philox RNG + rematerialisation (new, PARTIALLY VERIFIED)
+
+**Verified on CPU today (27 tests passing):**
+
+- **The Phase 4 adjoint derivation is correct.** `reference_philox_backward` matches `torch.autograd` to `rel_tol=1e-11` on shapes `(1,1)`, `(1,8)`, `(5,3)`, `(64,252)`. This is an *independent* derivation from Phase 3's: the increment is reparameterised as `a + σ√Δt·Z` rather than `a + σ·dW`, so the Vega term changes to `√Δt·Z − σΔt`. A dedicated test asserts the `√Δt` factor is present, since a naive port of Phase 3's Vega would drop it.
+- **The int32 offset-aliasing guard is tested.** `validate_offset_scheme` rejects any configuration whose offset range could wrap, and `test_the_naive_global_scheme_would_have_overflowed` documents the arithmetic: 8M paths fit in int32, 10M and 20M do not.
+- **`reference_philox_backward` is double-differentiable**, preserving the second-order fallback.
+- **Graceful degradation**: module imports with no Triton (reuses Phase 3's stubs); the helper raises an actionable `RuntimeError`.
+
+**NOT yet verified — requires Colab:**
+
+- The forward kernel's `tl.randn` usage and the distributional correctness of the generated increments.
+- The backward kernel's rematerialisation (does it regenerate *identical* `Z`?).
+- All 20 GPU-tier tests: terminal/interior moment tests, stream-independence tests, the finite-difference gradient check, and the peak-memory assertions.
+- **No performance or memory number has been measured.** `bench_phase4.py` has never executed.
+
+**ARCHITECTURAL DECISIONS (logged)**
+
+1. **Path identity lives in the Philox *key*, not the counter.** This is the single most important decision in Phase 4. The obvious offset `m*n_steps + j` exceeds int32 at `M > ~8.5M` (N=252), and Triton's Philox **truncates its offset to 32 bits** — so at the 10M/20M path counts this phase targets, distinct `(path, step)` pairs would collide and the RNG would return *the same increments for different paths*. Nothing raises; the paths still look log-normal; the Monte-Carlo estimator is silently biased by correlation. The scheme adopted instead is `program_seed = seed + program_id`, `offset = local_m * n_steps + j`, keeping every offset under `BLOCK_M * N ≤ 16,128` for **any** M. Varying the key is the standard Random123 parallel-RNG idiom (Salmon et al. 2011). `validate_offset_scheme()` runs on every launch to convert this class of corruption into a loud failure.
+2. **The offset is deliberately independent of `BLOCK_N` but dependent on `BLOCK_M`.** Using the *global* time index `j` means the backward may chunk time differently from the forward. But `local_m` and `program_id` tie the stream to `BLOCK_M` and the grid, so **forward and backward must use identical `BLOCK_M`** or rematerialisation silently returns different numbers. `BLOCK_M` is stored on the autograd context and reused verbatim.
+3. **Recompute rather than store.** Storing `Z` for the backward would reinstate the exact `M×N` allocation Phase 4 exists to delete. Philox is a pure function of `(key, counter)`, so recomputation is bit-exact and costs a few integer rounds per element — far cheaper than an HBM round trip. Classic checkpointing trade (Griewank & Walther Ch. 12); recompute wins decisively for an RNG.
+4. **`dW` is no longer a differentiable input**, so there is no `grad_dW`. The Phase 4 adjoint is therefore *simpler* than Phase 3's, and the backward allocates only three tiny per-program partial buffers.
+5. **Non-tensor arguments in `autograd.Function`.** `(n_paths, n_steps, dt, seed)` are structurally non-differentiable and return `None` from `backward`.
+6. **float32 normals under float64 accumulation.** `tl.randn` is a 32-bit Philox construction, so the normals carry ~7 significant digits even when the scan runs in float64. Irrelevant for Monte Carlo (sampling error dominates by orders of magnitude) and — importantly — it does **not** weaken the finite-difference validation, because `Z` is held *fixed* across a bump so its precision cancels out of the difference quotient.
+7. **Statistical validation replaces bitwise validation.** Triton's RNG will never match `torch.randn` bitwise, so there is no reference trajectory to diff. Correctness is established via theoretical log-normal moments (with tolerances derived from *sample* standard errors, not hardcoded epsilons), stream-independence checks, and FD gradient agreement.
+8. **Vega is the rematerialisation canary.** Only Vega reads `Z`. So a backward that regenerates the wrong randoms produces a **wrong Vega alongside a correct Delta and Rho** — that asymmetry is the diagnostic signature, and the FD test's failure message says so explicitly.
+
+**HONEST SCOPE OF THE MEMORY CLAIM**
+
+Eliminating `dW` **halves** peak memory and roughly **doubles** the attainable path count; it does not make memory independent of `M·N`, because the output path matrix remains:
+
+| paths (fp32) | Phase 3 (dW + out) | Phase 4 (out only) | fits in 16 GiB? |
+|---|---|---|---|
+| 1M | 1.88 GiB | 0.94 GiB | both |
+| 5M | 9.41 GiB | 4.71 GiB | both |
+| 10M | 18.81 GiB | 9.42 GiB | **Phase 4 only** |
+| 20M | 37.63 GiB | 18.85 GiB | neither |
+
+On a 16 GiB card the practical limit moves from ~7.9M to ~15.9M paths. **M=20M needs an 80 GiB device** (A100) — on a T4/L4 both designs OOM at 20M, and the benchmark reports that rather than hiding it. Making peak `O(M)` requires fusing the payoff/exposure reduction into the kernel so paths are consumed as produced; that is Phase 5 and is deliberately not attempted here.
+
 ## Known bugs / technical blockers
 
 1. **BLOCKER #1 — BYPASSED, not fixed. Local GPU unusable; Phase 3 moves to Google Colab.** `Get-PnpDevice` on the RTX 3050 Laptop GPU reports `CM_PROB_FAILED_POST_START`; `nvidia-smi` fails with a permissions error; `torch.cuda.device_count() == 0` even though PyTorch 2.4.0+cu121 is CUDA-built (`torch.backends.cuda.is_built() == True`) and `nvcuda.dll` loads fine. This is an NVIDIA driver/device fault, not a PyTorch install issue.
@@ -188,11 +242,14 @@ xva-cuda-engine/
 
 ## Next immediate task for the upcoming session
 
-**Validate the Phase 3 kernels on Colab. Nothing else in Phase 3 can be trusted until this is done.**
+**Validate the Phase 3 AND Phase 4 kernels on Colab. Nothing in either phase can be trusted until this is done.**
 
-1. Bootstrap Colab (see below), then run `python -m pytest tests/test_phase3.py -v`. The 27 currently-skipped GPU tests must run and pass. Expect to iterate — the kernels have never executed. Most likely failure points, in order: `tl.cumsum` axis semantics on the 2-D tile, the `range(0, n_steps, BLOCK_N)` dynamic loop bound, `tl.store` of a 0-d reduction into the partial buffers, and float64 support for `tl.exp`.
-2. Only once the tests pass, run `python benchmarks/bench_phase3.py` and record the numbers. Do not put a speedup figure in the write-up before this.
-3. Then re-run the full suite on GPU (`python -m pytest tests/ -q`) to confirm nothing regressed.
+1. Bootstrap Colab (see below), then `python -m pytest tests/test_phase3.py -v`. The 27 skipped GPU tests must run and pass. Expect to iterate — the kernels have never executed. Likely failure points, in order: `tl.cumsum` axis semantics on the 2-D tile, the `range(0, n_steps, BLOCK_N)` dynamic loop bound, `tl.store` of a 0-d reduction into the partial buffers, float64 `tl.exp`.
+2. Then `python -m pytest tests/test_phase4.py -v` (20 GPU tests). Additional Phase 4 failure points: the exact `tl.randn(seed, offset)` signature and whether it accepts a 2-D offset tile; whether `tl.randn` returns float32 (the `.to(DTYPE)` cast assumes it does); and whether `seed + pid` is accepted as a runtime scalar key.
+3. **Run the moment tests before the gradient tests.** If the increments are not really `N(0, Δt)`, every gradient test is meaningless. `test_log_return_variance_matches_theory` is the sharpest single check — it would catch a missing `√Δt`.
+4. **If Vega fails FD while Delta and Rho pass, the bug is rematerialisation**, not the adjoint (the CPU tier already proved the formulas). Check that `BLOCK_M` and `seed` reaching the backward are identical to the forward's.
+5. Only once tests pass, run `python benchmarks/bench_phase3.py` then `python benchmarks/bench_phase4.py` and record the numbers. **Do not put any speedup or memory figure in the write-up before this.** Note `bench_phase4.py` defaults to M up to 20M, which needs ~19 GiB just for the output — on a T4/L4 expect OOM at 20M and possibly 10M; that is reported, not hidden. Use `--paths 1000000 5000000 10000000` on a smaller card.
+6. Re-run the full suite on GPU (`python -m pytest tests/ -q`) to confirm nothing regressed.
 
 Colab bootstrap (prerequisite for all of the above):
 
