@@ -235,8 +235,21 @@ def _philox_gbm_forward_kernel(
     """
     pid = tl.program_id(axis=0)
     offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-    local_m = tl.arange(0, BLOCK_M)
     mask_m = offs_m < n_paths
+
+    # local_m stays INT32 on purpose: it feeds the Philox offset, which must
+    # remain small (see validate_offset_scheme). Only the *global memory*
+    # offsets below are widened to int64.
+    local_m = tl.arange(0, BLOCK_M)
+
+    # --- 64-bit global addressing (do not remove) ----------------------
+    # tl.arange and tl.program_id yield int32, so `offs_m * stride` overflows
+    # once n_paths * stride passes INT32_MAX. At N=252 that is 8,488,077 paths:
+    # 10M x 253 = 2.53e9 wraps negative and surfaces as
+    #   "CUDA error: an illegal memory access was encountered"
+    # which poisons the CUDA context and cannot be caught. Promoting the row
+    # index to int64 forces the whole offset expression to int64.
+    row_out = offs_m.to(tl.int64) * out_stride_m
 
     s0 = tl.load(params_ptr + 0)
     mu = tl.load(params_ptr + 1)
@@ -256,7 +269,7 @@ def _philox_gbm_forward_kernel(
     zeros_mn = tl.zeros([BLOCK_M, BLOCK_N], dtype=DTYPE)
 
     # Column 0 is exactly S0 on every path.
-    tl.store(out_ptr + offs_m * out_stride_m, s0 + zeros_m, mask=mask_m)
+    tl.store(out_ptr + row_out, s0 + zeros_m, mask=mask_m)
 
     carry = zeros_m
     for start in range(0, n_steps, BLOCK_N):
@@ -276,8 +289,8 @@ def _philox_gbm_forward_kernel(
         log_path = tl.cumsum(increments, axis=1) + carry[:, None]
         tl.store(
             out_ptr
-            + offs_m[:, None] * out_stride_m
-            + (offs_n[None, :] + 1) * out_stride_n,
+            + row_out[:, None]
+            + (offs_n.to(tl.int64)[None, :] + 1) * out_stride_n,
             s0 * tl.exp(log_path),
             mask=mask,
         )
@@ -331,8 +344,21 @@ def _philox_gbm_backward_kernel(
     """
     pid = tl.program_id(axis=0)
     offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-    local_m = tl.arange(0, BLOCK_M)
     mask_m = offs_m < n_paths
+
+    # local_m stays INT32: it must reproduce the forward's Philox offset
+    # bit-for-bit, and that offset is deliberately kept inside int32.
+    local_m = tl.arange(0, BLOCK_M)
+
+    # --- 64-bit global addressing (do not remove) ----------------------
+    # tl.arange and tl.program_id yield int32, so `offs_m * stride` overflows
+    # once n_paths * stride passes INT32_MAX. At N=252 that is 8,488,077 paths:
+    # 10M x 253 = 2.53e9 wraps negative and surfaces as
+    #   "CUDA error: an illegal memory access was encountered"
+    # which poisons the CUDA context and cannot be caught. Promoting the row
+    # index to int64 forces the whole offset expression to int64.
+    row_go = offs_m.to(tl.int64) * go_stride_m
+    row_out = offs_m.to(tl.int64) * out_stride_m
 
     s0 = tl.load(params_ptr + 0)
     sigma = tl.load(params_ptr + 2)
@@ -346,7 +372,7 @@ def _philox_gbm_backward_kernel(
 
     # Column 0 depends on S0 alone, with dS/dS0 = 1.
     grad_column_zero = tl.load(
-        grad_out_ptr + offs_m * go_stride_m, mask=mask_m, other=0.0
+        grad_out_ptr + row_go, mask=mask_m, other=0.0
     )
     acc_s0 = tl.where(mask_m, grad_column_zero, zeros_m)
     acc_mu = zeros_m
@@ -363,17 +389,14 @@ def _philox_gbm_backward_kernel(
         mask_n = offs_n < n_steps
         mask = mask_m[:, None] & mask_n[None, :]
 
+        offs_n_i64 = offs_n.to(tl.int64)
         grad_slice = tl.load(
-            grad_out_ptr
-            + offs_m[:, None] * go_stride_m
-            + (offs_n[None, :] + 1) * go_stride_n,
+            grad_out_ptr + row_go[:, None] + (offs_n_i64[None, :] + 1) * go_stride_n,
             mask=mask,
             other=0.0,
         )
         path_slice = tl.load(
-            out_ptr
-            + offs_m[:, None] * out_stride_m
-            + (offs_n[None, :] + 1) * out_stride_n,
+            out_ptr + row_out[:, None] + (offs_n_i64[None, :] + 1) * out_stride_n,
             mask=mask,
             other=0.0,
         )

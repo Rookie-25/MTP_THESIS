@@ -315,6 +315,16 @@ def _fused_gbm_forward_kernel(
     offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_m = offs_m < n_paths
 
+    # --- 64-bit global addressing (do not remove) ----------------------
+    # tl.arange and tl.program_id yield int32, so `offs_m * stride` overflows
+    # once n_paths * stride passes INT32_MAX. At N=252 that is 8,488,077 paths:
+    # 10M x 253 = 2.53e9 wraps negative and surfaces as
+    #   "CUDA error: an illegal memory access was encountered"
+    # which poisons the CUDA context and cannot be caught. Promoting the row
+    # index to int64 forces the whole offset expression to int64.
+    row_dw = offs_m.to(tl.int64) * dw_stride_m
+    row_out = offs_m.to(tl.int64) * out_stride_m
+
     s0 = tl.load(params_ptr + 0)
     mu = tl.load(params_ptr + 1)
     sigma = tl.load(params_ptr + 2)
@@ -327,7 +337,7 @@ def _fused_gbm_forward_kernel(
     zeros_mn = tl.zeros([BLOCK_M, BLOCK_N], dtype=DTYPE)
 
     # Column 0 is exactly S0 on every path (log-path offset zero).
-    tl.store(out_ptr + offs_m * out_stride_m, s0 + zeros_m, mask=mask_m)
+    tl.store(out_ptr + row_out, s0 + zeros_m, mask=mask_m)
 
     carry = zeros_m
     for start in range(0, n_steps, BLOCK_N):
@@ -335,8 +345,9 @@ def _fused_gbm_forward_kernel(
         mask_n = offs_n < n_steps
         mask = mask_m[:, None] & mask_n[None, :]
 
+        offs_n_i64 = offs_n.to(tl.int64)
         dw = tl.load(
-            dw_ptr + offs_m[:, None] * dw_stride_m + offs_n[None, :] * dw_stride_n,
+            dw_ptr + row_dw[:, None] + offs_n_i64[None, :] * dw_stride_n,
             mask=mask,
             other=0.0,
         )
@@ -349,9 +360,7 @@ def _fused_gbm_forward_kernel(
 
         # Time index j lands in output column j + 1.
         tl.store(
-            out_ptr
-            + offs_m[:, None] * out_stride_m
-            + (offs_n[None, :] + 1) * out_stride_n,
+            out_ptr + row_out[:, None] + (offs_n_i64[None, :] + 1) * out_stride_n,
             s0 * tl.exp(log_path),
             mask=mask,
         )
@@ -418,6 +427,18 @@ def _fused_gbm_backward_kernel(
     offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_m = offs_m < n_paths
 
+    # --- 64-bit global addressing (do not remove) ----------------------
+    # tl.arange and tl.program_id yield int32, so `offs_m * stride` overflows
+    # once n_paths * stride passes INT32_MAX. At N=252 that is 8,488,077 paths:
+    # 10M x 253 = 2.53e9 wraps negative and surfaces as
+    #   "CUDA error: an illegal memory access was encountered"
+    # which poisons the CUDA context and cannot be caught. Promoting the row
+    # index to int64 forces the whole offset expression to int64.
+    row_go = offs_m.to(tl.int64) * go_stride_m
+    row_out = offs_m.to(tl.int64) * out_stride_m
+    row_dw = offs_m.to(tl.int64) * dw_stride_m
+    row_gdw = offs_m.to(tl.int64) * gdw_stride_m
+
     s0 = tl.load(params_ptr + 0)
     sigma = tl.load(params_ptr + 2)
     dt = tl.load(params_ptr + 3)
@@ -427,7 +448,7 @@ def _fused_gbm_backward_kernel(
 
     # Column 0 depends on S0 directly (dS/dS0 = 1) and on nothing else.
     grad_column_zero = tl.load(
-        grad_out_ptr + offs_m * go_stride_m, mask=mask_m, other=0.0
+        grad_out_ptr + row_go, mask=mask_m, other=0.0
     )
     acc_s0 = tl.where(mask_m, grad_column_zero, zeros_m)
     acc_mu = zeros_m
@@ -446,16 +467,14 @@ def _fused_gbm_backward_kernel(
         mask_n = offs_n < n_steps
         mask = mask_m[:, None] & mask_n[None, :]
 
-        column_offsets = (offs_n[None, :] + 1) * go_stride_n
+        offs_n_i64 = offs_n.to(tl.int64)
         grad_slice = tl.load(
-            grad_out_ptr + offs_m[:, None] * go_stride_m + column_offsets,
+            grad_out_ptr + row_go[:, None] + (offs_n_i64[None, :] + 1) * go_stride_n,
             mask=mask,
             other=0.0,
         )
         path_slice = tl.load(
-            out_ptr
-            + offs_m[:, None] * out_stride_m
-            + (offs_n[None, :] + 1) * out_stride_n,
+            out_ptr + row_out[:, None] + (offs_n_i64[None, :] + 1) * out_stride_n,
             mask=mask,
             other=0.0,
         )
@@ -470,15 +489,13 @@ def _fused_gbm_backward_kernel(
         q = tl.where(mask, suffix + carry[:, None], zeros_mn)
 
         tl.store(
-            grad_dw_ptr
-            + offs_m[:, None] * gdw_stride_m
-            + offs_n[None, :] * gdw_stride_n,
+            grad_dw_ptr + row_gdw[:, None] + offs_n_i64[None, :] * gdw_stride_n,
             sigma * q,
             mask=mask,
         )
 
         dw = tl.load(
-            dw_ptr + offs_m[:, None] * dw_stride_m + offs_n[None, :] * dw_stride_n,
+            dw_ptr + row_dw[:, None] + offs_n_i64[None, :] * dw_stride_n,
             mask=mask,
             other=0.0,
         )

@@ -84,24 +84,111 @@ MATURITY = 1.0
 _BYTES_PER_GIB = 1024.0**3
 _BYTES_PER_MIB = 1024.0**2
 
+#: Fraction of *free* VRAM a run is allowed to need before it is refused.
+#: Deliberately below 1.0: the caching allocator fragments, cuBLAS/Triton keep
+#: workspaces, and the driver reserves a slice, so a run needing 99% of free
+#: memory will fail in practice.
+VRAM_SAFETY_FRACTION = 0.90
+
+
+def free_vram_bytes() -> int:
+    """Return currently free device memory in bytes.
+
+    Uses ``torch.cuda.mem_get_info``, which reports the driver's view rather
+    than PyTorch's, so memory held by other processes or by cached-but-unfreed
+    blocks is accounted for.
+
+    Returns:
+        Free bytes on the current device.
+    """
+    free, _total = torch.cuda.mem_get_info()
+    return int(free)
+
+
+def predict_peak_bytes(
+    n_paths: int,
+    n_steps: int,
+    element_size: int,
+    *,
+    include_dw: bool,
+    include_backward: bool,
+) -> int:
+    """Predict the peak allocation a configuration will require.
+
+    Counts only the :math:`O(MN)` tensors, which dominate everything else by
+    orders of magnitude at these scales:
+
+    * output paths -- ``M * (N + 1)``, both backends
+    * ``dW`` -- ``M * N``, Phase 3 only
+    * incoming adjoint -- ``M * (N + 1)``, backward only
+    * ``grad_dW`` -- ``M * N``, Phase 3 backward only
+
+    Args:
+        n_paths: Monte-Carlo paths :math:`M`.
+        n_steps: Time steps :math:`N`.
+        element_size: Bytes per element.
+        include_dw: Whether the backend materialises ``dW`` (Phase 3 does).
+        include_backward: Whether the adjoint is included in the measurement.
+
+    Returns:
+        Predicted peak bytes.
+    """
+    output_bytes = n_paths * (n_steps + 1) * element_size
+    increment_bytes = n_paths * n_steps * element_size
+
+    total = output_bytes
+    if include_dw:
+        total += increment_bytes
+    if include_backward:
+        total += output_bytes  # the incoming adjoint is output-shaped
+        if include_dw:
+            total += increment_bytes  # grad_dW
+    return total
+
 
 @dataclass
 class Measurement:
-    """Timing and peak allocation for one backend at one problem size."""
+    """Timing and peak allocation for one backend at one problem size.
+
+    Attributes:
+        milliseconds: Best observed device time, or ``None`` if it never ran.
+        peak_bytes: Observed peak allocation, or ``None``.
+        failed_oom: The run was attempted and the allocator refused it.
+        predicted_oom: The run was **never attempted** because a pre-flight
+            estimate showed it could not fit. This distinction matters: an
+            attempted run that overflows a 32-bit offset raises
+            ``illegal memory access``, which poisons the CUDA context for the
+            rest of the process and cannot be caught. Refusing up front keeps
+            the remaining sweep alive.
+        predicted_bytes: What the refused configuration would have needed.
+    """
 
     milliseconds: Optional[float] = None
     peak_bytes: Optional[int] = None
     failed_oom: bool = False
+    predicted_oom: bool = False
+    predicted_bytes: Optional[int] = None
 
     @property
     def ok(self) -> bool:
         return self.milliseconds is not None
 
     @property
+    def skipped(self) -> bool:
+        """Whether this configuration never ran, for either OOM reason."""
+        return self.failed_oom or self.predicted_oom
+
+    @property
     def peak_gib(self) -> Optional[float]:
         if self.peak_bytes is None:
             return None
         return self.peak_bytes / _BYTES_PER_GIB
+
+    @property
+    def predicted_gib(self) -> Optional[float]:
+        if self.predicted_bytes is None:
+            return None
+        return self.predicted_bytes / _BYTES_PER_GIB
 
 
 @dataclass
@@ -145,10 +232,20 @@ def _is_oom(error: BaseException) -> bool:
 
 
 def _reset_cuda() -> None:
-    """Release cached blocks and clear peak stats so the next size starts clean."""
+    """Release cached blocks and clear peak stats so the next size starts clean.
+
+    Called between every backend and every problem size. At these allocation
+    sizes the caching allocator will otherwise hold multi-GiB blocks from the
+    previous iteration, which both fragments the heap and makes the next
+    measurement's peak meaningless. ``synchronize`` first, so no in-flight
+    kernel is still holding a reference when the cache is dropped.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
+    torch.cuda.reset_accumulated_memory_stats()
 
 
 def measure(operation: Callable[[], None], *, repeats: int) -> Measurement:
@@ -250,10 +347,41 @@ def benchmark_one(
                     S0, MU, SIGMA, n_paths, n_steps, dt, seed=seed, dtype=dtype
                 )
 
+    # ---- pre-flight VRAM check -------------------------------------
+    # Refuse configurations that provably cannot fit rather than letting CUDA
+    # fail asynchronously. This is not just tidier: a run that exceeds device
+    # memory *or* overflows a 32-bit pointer offset can raise
+    # "illegal memory access", which poisons the CUDA context and aborts the
+    # whole sweep. A cheap arithmetic check up front keeps later sizes running.
+    element_size = torch.tensor([], dtype=dtype).element_size()
+
     _reset_cuda()
-    phase3 = measure(phase3_operation, repeats=repeats)
+    budget = int(VRAM_SAFETY_FRACTION * free_vram_bytes())
+
+    phase3_need = predict_peak_bytes(
+        n_paths, n_steps, element_size,
+        include_dw=True, include_backward=include_backward,
+    )
+    phase4_need = predict_peak_bytes(
+        n_paths, n_steps, element_size,
+        include_dw=False, include_backward=include_backward,
+    )
+
+    if phase3_need > budget:
+        phase3 = Measurement(predicted_oom=True, predicted_bytes=phase3_need)
+    else:
+        phase3 = measure(phase3_operation, repeats=repeats)
+
     _reset_cuda()
-    phase4 = measure(phase4_operation, repeats=repeats)
+    # Re-read the budget: Phase 3 may have left the allocator in a different
+    # state, and Phase 4 deserves an honest, current figure.
+    budget = int(VRAM_SAFETY_FRACTION * free_vram_bytes())
+
+    if phase4_need > budget:
+        phase4 = Measurement(predicted_oom=True, predicted_bytes=phase4_need)
+    else:
+        phase4 = measure(phase4_operation, repeats=repeats)
+
     _reset_cuda()
 
     return BenchmarkRow(n_paths=n_paths, n_steps=n_steps, phase3=phase3, phase4=phase4)
@@ -263,6 +391,8 @@ def benchmark_one(
 # Reporting
 # ==========================================================================
 def _time_cell(measurement: Measurement) -> str:
+    if measurement.predicted_oom:
+        return "OOM (pred)"
     if measurement.failed_oom:
         return "OOM"
     if not measurement.ok:
@@ -271,6 +401,9 @@ def _time_cell(measurement: Measurement) -> str:
 
 
 def _memory_cell(measurement: Measurement) -> str:
+    if measurement.predicted_oom:
+        # Report what it *would* have needed: that is the informative number.
+        return f"~{measurement.predicted_gib:,.2f}" if measurement.predicted_gib else "OOM (pred)"
     if measurement.failed_oom:
         return "OOM"
     if measurement.peak_gib is None:
@@ -356,14 +489,15 @@ def render_analysis(
     # Where each design runs out of device.
     p3_ceiling = total_vram_bytes / (element_size * (2 * 252 + 1))
     p4_ceiling = total_vram_bytes / (element_size * 253)
-    survived = [row for row in rows if row.phase3.failed_oom and row.phase4.ok]
+    survived = [row for row in rows if row.phase3.skipped and row.phase4.ok]
 
     lines.append("")
     if survived:
         lines.append("  CEILING SHATTERED -- Phase 4 completed where Phase 3 ran out:")
         for row in survived:
+            reason = "OOM (predicted)" if row.phase3.predicted_oom else "OOM"
             lines.append(
-                f"    M={row.n_paths:,}  P3 OOM  ->  P4 "
+                f"    M={row.n_paths:,}  P3 {reason}  ->  P4 "
                 f"{row.phase4.milliseconds:,.1f} ms at "
                 f"{row.phase4.peak_gib:,.2f} GiB peak"
             )
@@ -373,7 +507,7 @@ def render_analysis(
             "higher\n  to find the crossover on this device."
         )
 
-    both_oom = [row for row in rows if row.phase3.failed_oom and row.phase4.failed_oom]
+    both_oom = [row for row in rows if row.phase3.skipped and row.phase4.skipped]
     if both_oom:
         lines.append("")
         lines.append("  Beyond BOTH designs (the output tensor itself no longer fits):")
@@ -401,6 +535,11 @@ def render_analysis(
             "  Note: dW generation is timed inside the Phase 3 measurement, since",
             "  Phase 4 must produce its increments too. Excluding it would flatter",
             "  Phase 3 by treating its input as free.",
+            "",
+            "  'OOM (pred)' means the run was refused by the pre-flight VRAM check",
+            f"  (needs more than {VRAM_SAFETY_FRACTION:.0%} of free memory) and never",
+            "  launched. Attempting it risks an uncatchable illegal-memory-access",
+            "  abort that would poison the CUDA context and kill the whole sweep.",
         ]
     )
     return "\n".join(lines)
@@ -417,6 +556,7 @@ def write_csv(rows: Sequence[BenchmarkRow], destination: Path) -> None:
                 "phase3_ms", "phase4_ms", "speedup",
                 "phase3_peak_bytes", "phase4_peak_bytes", "memory_ratio",
                 "phase4_mpath_steps_per_s", "phase3_oom", "phase4_oom",
+                "phase3_predicted_oom", "phase4_predicted_oom",
             ]
         )
         for row in rows:
@@ -433,6 +573,8 @@ def write_csv(rows: Sequence[BenchmarkRow], destination: Path) -> None:
                     "" if row.throughput_phase4 is None else f"{row.throughput_phase4:.3f}",
                     int(row.phase3.failed_oom),
                     int(row.phase4.failed_oom),
+                    int(row.phase3.predicted_oom),
+                    int(row.phase4.predicted_oom),
                 ]
             )
 
@@ -520,6 +662,10 @@ def main() -> int:
         f"(minimum), warm-up excluded"
     )
     print(f"  Measuring : {'forward + backward' if args.backward else 'forward only'}")
+    print(
+        f"  Guard     : pre-flight VRAM check at {VRAM_SAFETY_FRACTION:.0%} of free "
+        f"({free_vram_bytes() / _BYTES_PER_GIB:,.1f} GiB free now)"
+    )
     print()
 
     rows: List[BenchmarkRow] = []

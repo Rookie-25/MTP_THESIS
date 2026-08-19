@@ -248,6 +248,115 @@ class TestOffsetSchemeGuard:
             validate_offset_scheme(block_m, n_steps)
 
 
+class TestGlobalPointerAddressing:
+    """Regression: 64-bit global pointer arithmetic in the kernels.
+
+    Observed on Colab at M=10,000,000, N=252:
+        CUDA error: an illegal memory access was encountered
+
+    Root cause was NOT the Philox offset (which
+    :class:`TestOffsetSchemeGuard` already covers) but the *global memory*
+    offsets. ``tl.arange`` and ``tl.program_id`` yield int32, so
+    ``offs_m * out_stride_m`` overflowed once ``n_paths * (n_steps + 1)``
+    passed INT32_MAX, wrapping negative and dereferencing out of bounds.
+
+    Two distinct 32-bit hazards therefore exist in these kernels, and
+    conflating them is easy:
+
+    ==========================  ==================  ==========================
+    hazard                      symptom             fix
+    ==========================  ==================  ==========================
+    Philox offset overflow      silent path         keep offset small via
+                                correlation         per-program keys
+    global pointer overflow     illegal memory      promote row index to
+                                access (crash)      tl.int64
+    ==========================  ==================  ==========================
+
+    The first is silent and statistical; the second is loud and fatal. These
+    tests pin down the arithmetic of the second so the int64 casts cannot be
+    "simplified" away later.
+    """
+
+    INT32_MAX = 2**31 - 1
+
+    @pytest.mark.parametrize(
+        "n_paths,n_steps,overflows",
+        [
+            (1_000_000, 252, False),
+            (5_000_000, 252, False),
+            (8_000_000, 252, False),
+            (8_488_078, 252, True),   # first path count that overflows
+            (10_000_000, 252, True),  # the configuration that actually crashed
+            (20_000_000, 252, True),
+        ],
+    )
+    def test_documents_where_int32_addressing_breaks(
+        self, n_paths: int, n_steps: int, overflows: bool
+    ) -> None:
+        """The output-tensor element count vs INT32_MAX."""
+        largest_offset = n_paths * (n_steps + 1)
+        assert (largest_offset > self.INT32_MAX) is overflows, (
+            f"M={n_paths:,} N={n_steps}: offset {largest_offset:,} vs "
+            f"INT32_MAX {self.INT32_MAX:,}"
+        )
+
+    def test_exact_breakeven_path_count(self) -> None:
+        """Pin the threshold so a future stride change is caught."""
+        n_steps = 252
+        breakeven = self.INT32_MAX // (n_steps + 1)
+        assert breakeven == 8_488_077
+        assert breakeven * (n_steps + 1) <= self.INT32_MAX
+        assert (breakeven + 1) * (n_steps + 1) > self.INT32_MAX
+
+    def test_int64_offsets_are_sufficient_at_extreme_scale(self) -> None:
+        """int64 has ample headroom for any configuration we will ever run."""
+        int64_max = 2**63 - 1
+        for n_paths in (20_000_000, 100_000_000, 1_000_000_000):
+            assert n_paths * 253 < int64_max
+
+    def test_kernels_promote_row_offsets_to_int64(self) -> None:
+        """Source-level guard: every kernel must widen its row index.
+
+        A static check, because the failure it prevents needs a >8.5M-path GPU
+        run to reproduce -- far too expensive to be a normal test. If someone
+        removes a cast, this fails locally in milliseconds instead of crashing
+        on Colab an hour into a benchmark.
+        """
+        from pathlib import Path
+
+        repository_root = Path(__file__).resolve().parents[1]
+        for module in ("triton_gbm.py", "triton_philox_gbm.py"):
+            source = (repository_root / "src" / "csrc" / module).read_text(
+                encoding="utf-8"
+            )
+            assert "offs_m.to(tl.int64)" in source, (
+                f"{module} lost its int64 row-offset promotion; global pointer "
+                "arithmetic will overflow past ~8.5M paths"
+            )
+            # The pre-fix pattern must not come back.
+            assert "offs_m[:, None] * out_stride_m" not in source, (
+                f"{module} has int32 row-offset arithmetic again"
+            )
+            assert "offs_m * out_stride_m" not in source, (
+                f"{module} has int32 row-offset arithmetic again"
+            )
+
+    def test_philox_offset_remains_int32(self) -> None:
+        """The RNG offset must stay int32 -- widening it would change the RNG.
+
+        The two hazards pull in opposite directions: global offsets must be
+        int64, but the Philox counter must stay int32 and small, because that is
+        what makes rematerialisation reproducible and offsets collision-free.
+        """
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "src" / "csrc" / "triton_philox_gbm.py"
+        ).read_text(encoding="utf-8")
+        assert "rng_offset = (local_m[:, None] * n_steps + offs_n[None, :]).to(tl.int32)" in source
+
+
 class TestGracefulDegradation:
     """Import must succeed and failure must be actionable without Triton/CUDA."""
 

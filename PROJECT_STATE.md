@@ -1,7 +1,7 @@
 # PROJECT_STATE.md
 
 **Project:** GPU-Native Differentiable AAD Monte-Carlo XVA & Greeks Engine with Neural-SDE / Rough-Volatility Calibration
-**Last updated:** 2026-08-19
+**Last updated:** 2026-08-19 (int64 addressing fix)
 
 ---
 
@@ -220,6 +220,29 @@ Eliminating `dW` **halves** peak memory and roughly **doubles** the attainable p
 | 20M | 37.63 GiB | 18.85 GiB | neither |
 
 On a 16 GiB card the practical limit moves from ~7.9M to ~15.9M paths. **M=20M needs an 80 GiB device** (A100) — on a T4/L4 both designs OOM at 20M, and the benchmark reports that rather than hiding it. Making peak `O(M)` requires fusing the payoff/exposure reduction into the kernel so paths are consumed as produced; that is Phase 5 and is deliberately not attempted here.
+
+### Phase 4 — FIXED 2026-08-19: int32 global pointer overflow (crashed on Colab)
+
+**Symptom:** `CUDA error: an illegal memory access was encountered` at M=10,000,000, N=252 during the first Colab run of `bench_phase4.py`.
+
+**Root cause:** *not* the Philox offset (which `validate_offset_scheme` already guarded) but the **global memory** pointer arithmetic. `tl.arange` and `tl.program_id` yield **int32**, so `offs_m * out_stride_m` overflowed once `n_paths * (n_steps + 1)` passed INT32_MAX. Exact threshold: **8,488,077 paths** at N=252. At 10M it computes 2.53e9, wraps negative, and dereferences out of bounds.
+
+**Two distinct 32-bit hazards exist in these kernels and must not be conflated:**
+
+| hazard | symptom | fix |
+|---|---|---|
+| Philox *counter* overflow | **silent** path correlation, no error | keep offset small via per-program keys (`seed + pid`) |
+| Global *pointer* overflow | **loud** illegal memory access, context poisoned | promote row index to `tl.int64` |
+
+The first is statistical and silent; the second is fatal and immediate. They pull in *opposite* directions — global offsets must be widened to int64, while the Philox counter must stay int32 and small. Both invariants are now asserted by source-level tests.
+
+**Fix applied (14 edits across both kernel files):** row indices promoted once per kernel into `row_out` / `row_dw` / `row_go` / `row_gdw` via `offs_m.to(tl.int64) * stride`, and column offsets via `offs_n.to(tl.int64)`. Every global load/store now derives from those int64 bases. `local_m` and `rng_offset` deliberately remain int32.
+
+**Note this affected Phase 3 too** (`triton_gbm.py`), which had the identical bug in four places — it just had not been run at >8.5M paths yet. Both are fixed.
+
+**Regression cover added (`TestGlobalPointerAddressing`, 10 tests, all CPU-runnable):** the exact break-even path count is pinned at 8,488,077; int64 headroom is verified to 1e9 paths; and two **source-level static checks** assert the `offs_m.to(tl.int64)` casts are present and the pre-fix int32 patterns have not returned. Static checks were chosen deliberately — reproducing the real failure needs a >8.5M-path GPU run, far too expensive for a normal test, so this fails locally in milliseconds instead of crashing an hour into a Colab benchmark.
+
+**Benchmark hardening (`bench_phase4.py`):** a pre-flight VRAM check now refuses any configuration needing more than 90% of *free* memory (`torch.cuda.mem_get_info`), reporting `OOM (pred)` plus what it would have needed, without launching. This matters beyond tidiness: an illegal memory access **poisons the CUDA context for the whole process and cannot be caught**, so one bad size would abort the entire sweep. `_reset_cuda()` now also synchronises before dropping the cache and clears accumulated stats, and the budget is re-read between backends.
 
 ## Known bugs / technical blockers
 
