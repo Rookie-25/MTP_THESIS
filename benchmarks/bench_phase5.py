@@ -290,7 +290,7 @@ def benchmark_one(
     element_size = torch.tensor([], dtype=dtype).element_size()
     legs = portfolio()
 
-    times = torch.linspace(0.0, MATURITY, n_steps + 1, device=device, dtype=dtype)
+    times = torch.linspace(0.0, MATURITY, n_steps + 1, device=device, dtype=torch.float64)
     coeff_b, coeff_c = build_affine_coefficients(legs, times, RATE)
 
     def phase4_operation() -> torch.Tensor:
