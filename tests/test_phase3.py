@@ -523,7 +523,7 @@ class TestPipelineIntegration:
                 expected_exposure(mtm), times, 0.02, 0.4, discount_rate=MU
             )
             cva.backward()
-            return float(cva), float(s0.grad), float(sigma.grad)
+            return float(cva.detach()), float(s0.grad), float(sigma.grad)
 
         reference = cva_for(simulate_gbm)
         fused = cva_for(triton_simulate_gbm)

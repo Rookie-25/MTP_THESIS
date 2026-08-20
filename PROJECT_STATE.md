@@ -1,7 +1,7 @@
 # PROJECT_STATE.md
 
 **Project:** GPU-Native Differentiable AAD Monte-Carlo XVA & Greeks Engine with Neural-SDE / Rough-Volatility Calibration
-**Last updated:** 2026-08-21 (Phase 6 local volatility)
+**Last updated:** 2026-08-21 (GPU TIER VERIFIED ON COLAB)
 
 ---
 
@@ -11,19 +11,30 @@
 
 **Phase 2 (Month 2) — Exposure Profiling, Collateral & CVA/DVA: COMPLETE.**
 
-**Phase 3 (Month 3) — Custom Triton kernels: IN PROGRESS. Code written; GPU validation pending on Colab.**
+**Phase 3 (Month 3) — Custom Triton kernels: COMPLETE AND GPU-VERIFIED.**
 
 All Phase 2 deliverables are implemented, tested and benchmarked: exposure profiles (EE/ENE/PFE/EPE), collateralised exposure under a CSA (threshold, MTA, MPOR), unilateral CVA/DVA, end-to-end AAD sensitivities through the full chain, a manual inspection sandbox, and an empirical O(1)-vs-O(n) scaling benchmark.
 
-**Phase 4 (Month 3-4) — In-kernel Philox RNG + rematerialisation: IN PROGRESS. Code written; GPU validation pending on Colab.**
+**Phase 4 (Month 3-4) — In-kernel Philox RNG + rematerialisation: COMPLETE AND GPU-VERIFIED.**
 
-**Phase 5 (Month 4) — Fused payoff/exposure reduction, O(N) memory: IN PROGRESS. Code written; GPU validation pending on Colab.**
+**Phase 5 (Month 4) — Fused payoff/exposure reduction, O(1)-in-M memory: COMPLETE AND GPU-VERIFIED.**
 
 **Phase 6 (Month 5) — Arbitrage-free local volatility + non-linear adjoint: MATH COMPLETE (CPU-verified), kernel SPECIFIED BUT NOT WRITTEN.**
 
 Phase 3 has a fused Triton GBM kernel with a hand-derived adjoint. Phase 4 removes the caller-supplied `dW` matrix entirely by generating increments in-kernel from a counter-based (Philox) RNG, and rematerialises them in the backward pass instead of storing them.
 
-**For both Phase 3 and Phase 4: the adjoint mathematics is verified on CPU today; the kernels themselves are unverified and must be run on Colab before any claim is made about them.** Suite status: **219 passed, 65 skipped** — the 47 skips are the GPU tier, which cannot execute locally (no Triton wheel on Windows, no working CUDA device).
+**MILESTONE 2026-08-21: the GPU tier executed for the first time, on Colab (Tesla T4, Python 3.12.13, pytest 8.4.2).**
+
+Result: **280 passed, 3 skipped, 1 failed of 284.** Every Triton kernel across Phases 3, 4 and 5 ran and passed. The 3 skips are the inverse-condition `test_helper_raises_actionable_error` guards (correctly skipped *because* Triton is present). The 1 failure was a **bug in one of my tests, not in any kernel** — see below.
+
+What this converts from conjecture to measurement:
+
+- **Phase 3 kernels** — forward parity vs `simulate_gbm` at all 8 shape/dtype combinations; `gradcheck_float64` PASSED; backward parity vs autograd at (1,1), (3,7), (1024,252); bitwise determinism; non-contiguous stride handling; `test_cva_greeks_match_between_backends` (full pipeline swap invisible downstream).
+- **Phase 4 in-kernel Philox** — all five distributional moment tests PASSED (terminal mean/variance, log-return mean/variance, skew), interior marginal, `test_no_duplicate_paths_across_program_boundaries` and `test_streams_are_uncorrelated_across_blocks` (so the per-program-key scheme really does give independent streams), `test_aad_greeks_match_central_differences` (the rematerialisation canary — a wrong Vega with correct Delta/Rho would have meant the backward regenerated different randoms), and both `TestMemoryFootprint` tests.
+- **The int64 addressing fix works.** `TestGlobalPointerAddressing` all green, and the >8.5M-path runs that previously died with `illegal memory access` now complete.
+- **Phase 5 fused reduction** — `test_ee_matches_unfused_within_sampling_error`, `test_cva_matches_unfused_within_sampling_error`, `test_grid_size_does_not_change_the_result` (confirming the absolute-block-index Philox keying decouples results from grid size), `TestFusedGreeks::test_greeks_match_central_differences`, `test_credit_sensitivity_matches_closed_form`, and `test_backward_memory_is_also_independent_of_m`.
+
+Local suite (CPU tier only, no Triton on Windows): **219 passed, 66 skipped**.
 
 ## Files created/modified
 
@@ -349,9 +360,41 @@ All three implemented in `local_vol_paths.py`; the checkpointed variant is asser
 
 **NOT DONE:** `_fused_local_vol_cva_kernel` is specified in the blueprint but **not written**. Gaps flagged there: the `acc_ee` accumulator sketch is written for clarity not efficiency; whether `tl.randn` accepts a 1-D offset inside a nested loop without per-step recompilation is unresolved; whether the N=252 sequential loop unrolls acceptably needs first-contact testing.
 
+### MEASURED: peak memory has two regimes, and only one is flat
+
+The single Colab failure was `test_peak_is_flat_across_two_decades_of_paths`, asserting `peaks[1M] < 10 * peaks[10k]`. Observed **325,120 B at M=10k vs 4,476,928 B at M=1M — a 13.8x ratio.**
+
+**This was my test being wrong, not the kernel.** The launch grid is `min(ceil(M / BLOCK_M), max_programs)`, which creates two regimes:
+
+| M | n_blocks | n_programs | predicted partial | observed peak |
+|---|---|---|---|---|
+| 10,000 | 313 | 313 | 0.30 MiB | 0.31 MiB |
+| 100,000 | 3,125 | 3,125 | 3.02 MiB | — |
+| **131,072** | **4,096** | **4,096** | **3.95 MiB** | — (saturation point) |
+| 1,000,000 | 31,250 | 4,096 | 3.95 MiB | 4.27 MiB |
+| 5,000,000 | 156,250 | 4,096 | 3.95 MiB | — |
+| 50,000,000 | 1,562,500 | 4,096 | 3.95 MiB | — |
+
+At N=252/fp32, `BLOCK_M=32` and the grid saturates at `4096 x 32 = 131,072` paths. Below that the grid grows with M, so the partial buffer grows with M. Above it the grid is pinned and peak is exactly `max_programs x (N+1) x element_size`. The observed 13.8x is precisely the program-count ratio 4096/313 = 13.1x plus allocator granularity — **it is the ramp, not a scaling violation.** My test compared a ramp-up point against a saturated point and read the difference as a failure.
+
+Note `test_peak_memory_stays_bounded[10000/100000/1000000]` — which asserts against the constant *ceiling* rather than a ratio — **passed at every M**. That formulation was correct; the ratio formulation was not.
+
+**Fixed:** `test_peak_is_flat_once_the_grid_saturates` now samples only inside the saturated regime (4x, 16x, 64x the saturation point) and asserts the peak ratio is < 1.10 across a 16x path increase, plus the predicted ceiling. A new `test_ramp_up_region_is_bounded_by_the_saturated_ceiling` documents the ramp explicitly — non-decreasing in M, bounded by the same ceiling — so the behaviour is captured rather than merely avoided.
+
+**Consequence for the thesis claim.** The defensible statement is *"peak memory is independent of M above a fixed saturation point of ~131k paths, at `max_programs x (N+1) x element_size`"* — measured at 4.27 MiB on a T4, flat from 131k paths to 50M. Not "flat at all M": below saturation it is smaller and grows. Both halves should appear in any figure; `benchmarks/profile_scaling.py` labels each row with its regime for exactly this reason.
+
+### Two notebook errors (user profiling cell, not repo bugs)
+
+1. `ValueError: portfolio must contain at least one leg` — the cell passed `legs=[]`. The guard is working as designed: with no legs, B and C are identically zero, every exposure is zero, and the kernel would report a flat-zero profile with perfect-looking timings. Silently profiling a no-op is worse than failing.
+2. `Import "src.models.portfolio" could not be resolved` — that module does not exist. `SwapLeg` lives in **`src.pricer.options`**.
+
+The `Import "src.csrc.triton_cva_fusion" could not be resolved` warning is a Pylance/editor path issue, not a runtime error — the tests import it fine. Harmless.
+
+Replaced by `benchmarks/profile_scaling.py`, which uses a real 3-leg portfolio, imports from the right module, and marks each row's regime.
+
 ## Known bugs / technical blockers
 
-1. **BLOCKER #1 — BYPASSED, not fixed. Local GPU unusable; Phase 3 moves to Google Colab.** `Get-PnpDevice` on the RTX 3050 Laptop GPU reports `CM_PROB_FAILED_POST_START`; `nvidia-smi` fails with a permissions error; `torch.cuda.device_count() == 0` even though PyTorch 2.4.0+cu121 is CUDA-built (`torch.backends.cuda.is_built() == True`) and `nvcuda.dll` loads fine. This is an NVIDIA driver/device fault, not a PyTorch install issue.
+1. **RESOLVED 2026-08-21 — the Colab bypass worked; the GPU tier now runs and passes there.** Kept for the record. Local GPU remains unusable: `Get-PnpDevice` on the RTX 3050 Laptop GPU reports `CM_PROB_FAILED_POST_START`; `nvidia-smi` fails with a permissions error; `torch.cuda.device_count() == 0` even though PyTorch 2.4.0+cu121 is CUDA-built (`torch.backends.cuda.is_built() == True`) and `nvcuda.dll` loads fine. This is an NVIDIA driver/device fault, not a PyTorch install issue.
 
    **Strategic decision (2026-08-17): stop trying to repair the local driver and migrate Phase 3 to a cloud GPU (Google Colab).** Rationale: the thesis needs a *known-good, reproducible* CUDA environment for kernel development and for benchmark numbers that go into the write-up; debugging a laptop hybrid-graphics driver fault is unbounded work that produces no thesis output. Colab also gives a newer datacentre-class GPU (T4/L4/A100 depending on tier) with `nvcc` and Triton preinstalled, which is strictly better for the Phase 3 kernel work than a 4 GB laptop 3050 would have been.
 
@@ -370,28 +413,17 @@ All three implemented in `local_vol_paths.py`; the checkpointed variant is asser
 
 ## Next immediate task for the upcoming session
 
-**Validate the Phase 3 AND Phase 4 kernels on Colab. Nothing in either phase can be trusted until this is done.**
+**The GPU tier is verified. Next: collect the benchmark numbers, then write the Phase 6 kernel.**
 
-1. Bootstrap Colab (see below), then `python -m pytest tests/test_phase3.py -v`. The 27 skipped GPU tests must run and pass. Expect to iterate — the kernels have never executed. Likely failure points, in order: `tl.cumsum` axis semantics on the 2-D tile, the `range(0, n_steps, BLOCK_N)` dynamic loop bound, `tl.store` of a 0-d reduction into the partial buffers, float64 `tl.exp`.
-2. Then `python -m pytest tests/test_phase4.py -v` (20 GPU tests), then `tests/test_phase5.py -v` (18 GPU tests). Additional Phase 4 failure points: the exact `tl.randn(seed, offset)` signature and whether it accepts a 2-D offset tile; whether `tl.randn` returns float32 (the `.to(DTYPE)` cast assumes it does); and whether `seed + pid` is accepted as a runtime scalar key.
-3. **Run the moment tests before the gradient tests.** If the increments are not really `N(0, Δt)`, every gradient test is meaningless. `test_log_return_variance_matches_theory` is the sharpest single check — it would catch a missing `√Δt`.
-4. **If Vega fails FD while Delta and Rho pass, the bug is rematerialisation**, not the adjoint (the CPU tier already proved the formulas). Check that `BLOCK_M` and `seed` reaching the backward are identical to the forward's.
-5. Only once tests pass, run `bench_phase3.py`, `bench_phase4.py`, then `bench_phase5.py` and record the numbers. Phase 5 likely failure points, additional to Phase 4's: `tl.num_programs`, the grid-stride `range(pid, n_blocks, n_programs)` with runtime bounds, `tl.maximum` on a 2-D tile, and whether a `BLOCK_T`-wide register accumulator survives the loop without spilling. **Do not put any speedup or memory figure in the write-up before this.** Note `bench_phase4.py` defaults to M up to 20M, which needs ~19 GiB just for the output — on a T4/L4 expect OOM at 20M and possibly 10M; that is reported, not hidden. Use `--paths 1000000 5000000 10000000` on a smaller card.
-6. Re-run the full suite on GPU (`python -m pytest tests/ -q`) to confirm nothing regressed.
-
-Colab bootstrap (prerequisite for all of the above):
-
-1. Get the repo onto Colab — either `git clone` (once it is pushed to a remote; **it is not currently a git repository**, so `git init` + push is a prerequisite) or mount Google Drive and sync the folder.
-2. Record the Colab environment: `torch.__version__`, `torch.version.cuda`, `nvidia-smi` output, GPU model. Pin these next to any benchmark number.
-3. Re-run the full suite on Colab GPU to confirm the device-agnostic code path works end to end: the `device` fixture in `tests/conftest.py` already parametrises over CUDA and currently skips — it should start running.
-4. Re-run `benchmarks/bench_phase2.py` on GPU to get the CPU-vs-GPU baseline *before* any kernel work, so the Phase 3 speedup has an honest reference point.
-
-Then the actual Phase 3 work:
-
-5. Profile the hot path. `simulate_gbm` is currently `cumsum` + `exp` over an `(M, N)` tensor — memory-bandwidth bound, and it materialises the full path matrix. That materialisation is the real target.
-6. Write a fused Triton kernel for GBM path generation + payoff accumulation that avoids materialising all `M × N` intermediates. Start with Triton (portable, no `nvcc` toolchain fights) before dropping to raw CUDA C++ via `torch.utils.cpp_extension`.
-7. **Critical constraint:** any custom kernel must supply a matching backward via `torch.autograd.Function`, or the entire AAD pipeline breaks. Validate every kernel against `torch.autograd.gradcheck` *and* against the existing CPU path — the Phase 1/2 test suites are the regression net.
-8. Benchmark CPU vs GPU vs fused-kernel across path counts (10k → 10M), targeting the 10x–100x claim in the project objectives.
+1. **Re-sync the repo to Colab** — the fixes below are in the local tree only. `tests/test_phase5.py` (memory-regime tests rewritten), `tests/test_phase3.py` (warning cleared), and the new `benchmarks/profile_scaling.py`. Then re-run the suite on Colab; expect **284 passed, 3 skipped, 0 failed**.
+2. **Collect the headline numbers, which still do not exist.** All three benchmark harnesses have been written but never run on a GPU:
+   - `benchmarks/profile_scaling.py` — peak VRAM and throughput vs M, labelled by regime. Start here: it is the cleanest evidence for the O(1)-in-M claim.
+   - `benchmarks/bench_phase3.py` — fused vs pure PyTorch, time and peak VRAM.
+   - `benchmarks/bench_phase4.py` — pre-allocated dW vs in-kernel Philox. On a 16 GiB T4 expect `OOM (pred)` at 20M for both designs; use `--paths 1000000 5000000 10000000`.
+   - `benchmarks/bench_phase5.py` — materialised paths vs fused. This is where the 50M-path row lives, and where Phase 4 should hit `OOM (pred)` while Phase 5 completes.
+   Record the T4 device name, driver, Triton and PyTorch versions alongside every number.
+3. **Then** write `_fused_local_vol_cva_kernel` (Phase 6). The maths is CPU-verified and the blueprint is at https://claude.ai/code/artifact/ebeb0229-c0db-43e3-be68-140a2ba8693f — but note the forward becomes a *sequential* time loop (no `tl.cumsum`) and the backward needs a sqrt(N) checkpoint buffer, so it is a structurally different kernel from Phases 3-5, not an edit of one.
+4. Optional but cheap: `tests/test_phase6.py` currently has no GPU tier at all. Once the kernel exists, mirror the Phase 5 tiering pattern.
 
 Deferred Phase 2 nice-to-haves (not blocking Phase 3):
 

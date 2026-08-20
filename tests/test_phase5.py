@@ -593,20 +593,44 @@ class TestMemoryIndependenceOfM:
             )
         del profile
 
-    def test_peak_is_flat_across_two_decades_of_paths(self) -> None:
-        """The direct statement of the claim: 100x more paths, same memory.
+    def test_peak_is_flat_once_the_grid_saturates(self) -> None:
+        r"""Peak memory is flat in M **above the saturation point**.
 
-        Peaks are compared as a *ratio*, which is the meaningful form. They are
-        not asserted bitwise identical: the launch grid is
-        ``min(ceil(M/BLOCK_M), max_programs)``, so a small M legitimately
-        launches fewer programs and allocates slightly less.
+        The launch grid is ``min(ceil(M / BLOCK_M), max_programs)``, so there are
+        two distinct regimes and only one of them is flat:
+
+        * **Ramp-up**, ``M < max_programs * BLOCK_M``: the grid grows with M, so
+          the partial buffer grows with M. At N=252/fp32 this boundary is
+          ``4096 * 32 = 131,072`` paths.
+        * **Saturated**, ``M >= 131,072``: the grid is pinned at
+          ``max_programs``, so peak is exactly
+          ``max_programs * (N+1) * element_size`` -- identical at 1M, 5M and 50M.
+
+        Measured on a T4 (N=252, fp32): 0.31 MiB at M=10k (313 programs) and
+        4.27 MiB at M=1M (4096 programs). That 13.8x is the *program-count*
+        ratio, 4096/313 = 13.1x, not a violation of O(1) scaling -- an earlier
+        version of this test compared across the boundary and read the ramp as a
+        failure.
+
+        So this test measures inside the saturated regime, which is where the
+        O(1) claim actually lives. ``test_peak_memory_stays_bounded`` covers the
+        ramp-up region by asserting the constant ceiling instead, which holds at
+        every M.
         """
         n_steps = N_STEPS
+        block_m, _ = select_fused_block_sizes(n_steps, 4)
+        saturation_point = DEFAULT_MAX_PROGRAMS * block_m
+
         times = torch.linspace(
             0.0, MATURITY, n_steps + 1, device="cuda", dtype=torch.float32
         )
+        # Every sample must sit above the saturation point for the comparison to
+        # be about M-independence rather than about grid ramp-up.
+        samples = (4 * saturation_point, 16 * saturation_point, 64 * saturation_point)
+        assert all(m > saturation_point for m in samples)
+
         peaks = {}
-        for n_paths in (10_000, 100_000, 1_000_000):
+        for n_paths in samples:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
@@ -617,16 +641,52 @@ class TestMemoryIndependenceOfM:
             peaks[n_paths] = torch.cuda.max_memory_allocated()
             del profile
 
-        largest, smallest = max(peaks.values()), min(peaks.values())
-        # assert largest / smallest < 15*1024**2, (
-        #     "peak memory scales with M: "
-        #     + ", ".join(f"M={m:,}->{p / 1024**2:.2f} MiB" for m, p in peaks.items())
-        # )
-        assert largest < 15 * 1024**2, (
-            f"Memory is not O(1)! Peaked at {largest / 1024**2:.2f} MiB for M={max(peaks.keys())}"
+        report = ", ".join(
+            f"M={m:,}->{p / 1024**2:.2f} MiB" for m, p in sorted(peaks.items())
         )
-        # A 100x path increase must not cost anything like 100x memory.
-        assert peaks[1_000_000] < 10 * peaks[10_000]
+        largest, smallest = max(peaks.values()), min(peaks.values())
+
+        # A 16x path increase inside the saturated regime must cost nothing.
+        assert largest / smallest < 1.10, f"peak scales with M: {report}"
+
+        # And it must sit at the predicted M-independent ceiling.
+        predicted = DEFAULT_MAX_PROGRAMS * (n_steps + 1) * 4
+        assert largest < 2.0 * predicted, (
+            f"peak {largest / 1024**2:.2f} MiB exceeds 2x the predicted "
+            f"{predicted / 1024**2:.2f} MiB ceiling: {report}"
+        )
+
+    def test_ramp_up_region_is_bounded_by_the_saturated_ceiling(self) -> None:
+        """Below saturation, memory grows with M -- but never past the ceiling.
+
+        Documents the regime the flat-memory test deliberately excludes, so the
+        behaviour is captured rather than merely avoided.
+        """
+        n_steps = N_STEPS
+        block_m, _ = select_fused_block_sizes(n_steps, 4)
+        saturation_point = DEFAULT_MAX_PROGRAMS * block_m
+        ceiling = DEFAULT_MAX_PROGRAMS * (n_steps + 1) * 4
+
+        times = torch.linspace(
+            0.0, MATURITY, n_steps + 1, device="cuda", dtype=torch.float32
+        )
+        peaks = {}
+        for n_paths in (10_000, saturation_point // 4, saturation_point):
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            profile = fused_expected_exposure(
+                S0, MU, SIGMA, _legs(), times, RATE, n_paths, seed=SEED
+            )
+            torch.cuda.synchronize()
+            peaks[n_paths] = torch.cuda.max_memory_allocated()
+            del profile
+
+        ordered = [peaks[m] for m in sorted(peaks)]
+        # Non-decreasing in M through the ramp...
+        assert ordered == sorted(ordered), peaks
+        # ...and bounded by the same ceiling the saturated regime sits at.
+        assert max(ordered) < 2.0 * ceiling, peaks
 
 
 @requires_triton
