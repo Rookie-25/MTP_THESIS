@@ -1,7 +1,7 @@
 # PROJECT_STATE.md
 
 **Project:** GPU-Native Differentiable AAD Monte-Carlo XVA & Greeks Engine with Neural-SDE / Rough-Volatility Calibration
-**Last updated:** 2026-08-20 (Phase 5 fused reduction)
+**Last updated:** 2026-08-21 (Phase 6 local volatility)
 
 ---
 
@@ -19,9 +19,11 @@ All Phase 2 deliverables are implemented, tested and benchmarked: exposure profi
 
 **Phase 5 (Month 4) — Fused payoff/exposure reduction, O(N) memory: IN PROGRESS. Code written; GPU validation pending on Colab.**
 
+**Phase 6 (Month 5) — Arbitrage-free local volatility + non-linear adjoint: MATH COMPLETE (CPU-verified), kernel SPECIFIED BUT NOT WRITTEN.**
+
 Phase 3 has a fused Triton GBM kernel with a hand-derived adjoint. Phase 4 removes the caller-supplied `dW` matrix entirely by generating increments in-kernel from a counter-based (Philox) RNG, and rematerialises them in the backward pass instead of storing them.
 
-**For both Phase 3 and Phase 4: the adjoint mathematics is verified on CPU today; the kernels themselves are unverified and must be run on Colab before any claim is made about them.** Suite status: **175 passed, 65 skipped** — the 47 skips are the GPU tier, which cannot execute locally (no Triton wheel on Windows, no working CUDA device).
+**For both Phase 3 and Phase 4: the adjoint mathematics is verified on CPU today; the kernels themselves are unverified and must be run on Colab before any claim is made about them.** Suite status: **219 passed, 65 skipped** — the 47 skips are the GPU tier, which cannot execute locally (no Triton wheel on Windows, no working CUDA device).
 
 ## Files created/modified
 
@@ -113,7 +115,7 @@ xva-cuda-engine/
     └── test_phase5.py              # 54 tests: 37 CPU-tier passing, 18 GPU-tier skipped locally
 ```
 
-**Full suite: 175 passed, 65 skipped** (`python -m pytest tests/ -q`, ~32s on CPU).
+**Full suite: 219 passed, 65 skipped** (`python -m pytest tests/ -q`, ~40s on CPU).
 
 ## Verified math / working components
 
@@ -292,6 +294,60 @@ The first is statistical and silent; the second is fatal and immediate. They pul
 | 50M | 47.13 GiB | ~4 MiB |
 
 The claim is **bounded by a constant, not bitwise identical across M**: the grid is `min(ceil(M/BLOCK_M), max_programs)`, so a *small* M launches fewer programs and uses slightly *less*. What must never happen is growth with M. 50M paths is unreachable for Phase 4 on any current single GPU and routine for Phase 5 on a 16 GiB card — that is the headline, and it is the first phase where the memory result is qualitative rather than a constant factor.
+
+### Phase 6 — local volatility + non-linear adjoint (new, MATH VERIFIED / KERNEL NOT WRITTEN)
+
+`src/models/vol_surface.py`, `src/models/local_vol_paths.py`, `tests/test_phase6.py` (**44 tests, all passing on CPU** — no GPU tier, deliberately: the maths had to be settled before any Triton was written).
+
+Blueprint covering Modules 1/2/4/5: https://claude.ai/code/artifact/ebeb0229-c0db-43e3-be68-140a2ba8693f
+
+**THE CENTRAL FINDING — the Phase 3-5 adjoint structure does not survive state-dependent volatility.**
+
+Phases 3-5 exploited an accident of constant sigma: the log-Euler recursion is *affine* in the state, so the adjoint collapses to a **suffix sum** computable with one `tl.cumsum`. That collapse is the entire reason those kernels are fast and memory-flat. With `sigma(t,S)` the one-step Jacobian is no longer 1:
+
+    J_k = dX_{k+1}/dX_k = 1 + (dsigma_k/dX_k) * (sqrt(dt)*Z_k - sigma_k*dt)
+
+so the reverse sweep is a **sequential recursion** `a_k = Xbar_k + a_{k+1}*J_k`. No parallel scan primitive applies. Measured error from reusing the suffix-sum shortcut anyway, N=252, smooth centred skew:
+
+| mean abs(dsigma/dx) | sequential | suffix-sum | rel error |
+|---|---|---|---|
+| 0.0000 | 5.450408e+01 | 5.450408e+01 | 0.00% (Phase 3-5 case: exact) |
+| 0.0489 | 5.389047e+01 | 5.438165e+01 | 0.91% |
+| 0.1849 | 5.354359e+01 | 5.408721e+01 | 1.02% |
+| 1.1795 | 5.137390e+01 | 5.202345e+01 | 1.26% |
+
+**1% is not survivable**: it is a *bias*, not variance. It does not shrink as M grows, no statistical test on the exposure profile reveals it, and calibrating a surface by gradient descent on a systematically wrong gradient converges to a systematically wrong surface. The zero row is exactly what makes this easy to miss when porting.
+
+**Memory consequence.** The reverse sweep needs sigma_k and dsigma_k/dX_k in *descending* k, but the forward produces them ascending and cannot be inverted (solving for X_k needs sigma_k, which depends on X_k — implicit). Phases 3-5 escaped this because S was recoverable in closed form from one cumsum. Three strategies, per tile (BLOCK_M=16, 4096 programs, N=252, fp32):
+
+| strategy | extra memory | at N=252 | extra forward work |
+|---|---|---|---|
+| store full trajectory | O(B*N) | 66 MiB | none |
+| **sqrt(N) checkpointing (RECOMMENDED)** | **O(B*sqrt(N))** | **4 MiB** | **~1 extra pass** |
+| recompute from scratch | O(B) | 0.26 MiB | ~126x |
+
+All three implemented in `local_vol_paths.py`; the checkpointed variant is asserted to agree with full storage to 1e-12 across checkpoint counts {1,2,5,10,100}. **All are O(1) in M — the Phase 5 headline survives. What changes is the constant: the defensible claim becomes "flat in M, linear in sqrt(N)", not "flat".**
+
+**Verified on CPU (44 tests):**
+
+- **CORRECTION TO THE BRIEF's g(k).** The brief's first term is `(1 - (y/w)*dw/dy)^2`; Gatheral-Jacquier is `(1 - k*w'/(2w))^2` — a factor 2 in the denominator. Not cosmetic: g converts a total-variance slice into the risk-neutral density, so `g >= 0 <=> p >= 0`. Integrating the induced density over k in [-8,8] at 160,001 points on a skewed SSVI slice: **correct form 1.00000000, brief's form 0.98676357** (1.3% mass error, so it is not a density). Pinned by `test_the_factor_of_two_matters`.
+- **The two arbitrage conditions ARE the Dupire well-posedness conditions.** `sigma_LV^2 = (dw/dT)/g`, so calendar violation makes the numerator negative and butterfly violation makes the denominator vanish. Enforcing them is not an extra requirement bolted onto calibration — it is what makes sigma_LV well defined at all. Identity verified to rel_tol 1e-10.
+- **Sequential adjoint == autograd** to rel_tol 1e-9 on shapes (1,1), (4,8), (32,64), (16,252), for dL/dS0, dL/dbase, dL/dslope.
+- **Constraints discharged by construction, not by penalty**: ATM total variance is a cumsum of softplus increments, hence monotone for *any* parameter values (verified over 20 random draws); SSVI rho/eta/gamma map into their feasible sets.
+- **A test caught a real numerical bug**: bare `tanh` saturates to *exactly* 1.0 in float64 once |raw| >~ 19, putting rho on the boundary where `1-rho^2 = 0`, the SSVI root degenerates to `|phi*k + rho|` (non-differentiable), and both butterfly conditions collapse. Optimisers reach such raw values routinely in a bad line search. Fixed with `PARAMETER_MARGIN = 1e-6` on all three constrained parameters.
+- Penalty design: softplus hinge (finite and smooth for infeasible c, so it can *restore* feasibility) vs log-barrier (undefined for c<=0, enforces interiority). Schedule is hinge-then-barrier. Components reported separately so a calibration log shows *which* constraint binds.
+- Forward-mapping guard: local vol must be read at `k = log(S_t/F_t)`, not `log(S_t/S_0)`. The two agree at t=0, so an inception-only test cannot distinguish them; at t=2 with 4% net drift they differ by 0.08 in log-moneyness.
+
+**ARCHITECTURAL NOTES (corrections to the brief's Module 2 framing)**
+
+1. **Triton has no explicit shared-memory staging.** There is no primitive for "stage a tile in SRAM, then gather from it with computed indices". `tl.make_block_ptr` describes structured *strided* tiles, not data-dependent gathers, and a loaded `tl.tensor` cannot be indexed by a runtime tensor. What is achievable is `tl.load(surface_ptr + computed_offsets)`, which is **L1/L2 resident** because a realistic grid is tiny (24x50x4B ~ 4.7 KiB). The mechanism is cache residency, not SRAM staging — worth describing accurately in a thesis.
+2. **The stronger design removes the gather entirely**: calibrate the grid/spline in PyTorch, then compress to a parametric form (SSVI coefficients, or a low-order Chebyshev expansion in (t, log S)). 20-50 coefficients broadcast identically to every lane — pure register arithmetic, no memory access, no divergence at all.
+3. **Warp divergence and memory divergence are different problems.** Warp divergence is fully avoidable here (clamp with `tl.minimum`/`tl.maximum`, select with `tl.where`, never `if` on per-lane data). Memory divergence is unavoidable with a grid gather and is mitigated only by cache residency or by removing the gather.
+4. **BLOCK_M must shrink** from Phase 5's 32 to ~16: the surface tile competes with the path tile for the same SRAM budget.
+5. **Discretisation bias is now a real error source.** Log-Euler with frozen vol is weak order 1, whereas Phases 1-5 used the *exact* GBM solution. Keep it separate from MC error when attributing benchmark discrepancies.
+6. **Bandwidth utilisation is a misleading headline metric for a fused kernel.** "% of theoretical peak GB/s" will read *low* precisely because the fusion worked. Report arithmetic intensity and roofline position instead; keep the bandwidth figure as clearly-labelled supporting evidence that HBM traffic collapsed.
+
+**NOT DONE:** `_fused_local_vol_cva_kernel` is specified in the blueprint but **not written**. Gaps flagged there: the `acc_ee` accumulator sketch is written for clarity not efficiency; whether `tl.randn` accepts a 1-D offset inside a nested loop without per-step recompilation is unresolved; whether the N=252 sequential loop unrolls acceptably needs first-contact testing.
 
 ## Known bugs / technical blockers
 
