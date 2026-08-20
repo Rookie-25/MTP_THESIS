@@ -647,7 +647,7 @@ class TestRematerialisation:
         s0 = torch.tensor(S0, device="cuda", dtype=torch.float64, requires_grad=True)
         value = self._functional(s0, MU, SIGMA, weights)
         value.backward()
-        assert math.isclose(float(s0.grad), float(value) / S0, rel_tol=1e-10)
+        assert math.isclose(float(s0.grad.item()), float(value) / S0, rel_tol=1e-10)
 
     def test_partial_gradients_are_respected(self) -> None:
         weights = self._weights()
