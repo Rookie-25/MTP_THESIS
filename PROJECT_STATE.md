@@ -25,7 +25,11 @@ Phase 3 has a fused Triton GBM kernel with a hand-derived adjoint. Phase 4 remov
 
 **MILESTONE 2026-08-21: the GPU tier executed for the first time, on Colab (Tesla T4, Python 3.12.13, pytest 8.4.2).**
 
-Result: **280 passed, 3 skipped, 1 failed of 284.** Every Triton kernel across Phases 3, 4 and 5 ran and passed. The 3 skips are the inverse-condition `test_helper_raises_actionable_error` guards (correctly skipped *because* Triton is present). The 1 failure was a **bug in one of my tests, not in any kernel** — see below.
+Result, first run: 280 passed, 3 skipped, 1 failed of 284. The 3 skips are the inverse-condition `test_helper_raises_actionable_error` guards (correctly skipped *because* Triton is present). The 1 failure was a bug in one of my tests, not in any kernel (see "GPU findings" below) — fixed, re-run confirmed **282 passed, 3 skipped, 0 failed of 285** (one test added by the fix).
+
+**Outstanding, not yet re-verified on Colab (local fix, not pushed as of last sync):** a `UserWarning` in `tests/test_phase4.py::test_delta_matches_closed_form` — `float(value)` was converting a still-graph-attached tensor to a scalar. An earlier attempted fix (commit `8185c6a`, `s0.grad.item()`) did not address it, since the warning came from `value`, not `s0.grad`. Corrected locally to `float(value.detach())`; needs a push + Colab re-run to confirm **285 passed, 0 warnings**.
+
+**Undocumented change made directly against the repo (commit `d4998d2`), flagged here for review:** the uniform-time-grid tolerance in `fused_expected_exposure` (`src/csrc/triton_cva_fusion.py`) was loosened from `1e-6 * dt` to `1e-4 * dt` — a 100x relaxation of a correctness guard. No reasoning was recorded. Plausible explanation: `torch.linspace` in fp32 on the T4 produced grid spacing that failed the tighter bound. Worth a deliberate look before relying on it — a guard against a non-uniform grid is exactly the kind of check that should stay tight, since the collateral/MPOR machinery in Phase 2 depends on grid uniformity too.
 
 What this converts from conjecture to measurement:
 
@@ -415,7 +419,8 @@ Replaced by `benchmarks/profile_scaling.py`, which uses a real 3-leg portfolio, 
 
 **The GPU tier is verified. Next: collect the benchmark numbers, then write the Phase 6 kernel.**
 
-1. **Re-sync the repo to Colab** — the fixes below are in the local tree only. `tests/test_phase5.py` (memory-regime tests rewritten), `tests/test_phase3.py` (warning cleared), and the new `benchmarks/profile_scaling.py`. Then re-run the suite on Colab; expect **284 passed, 3 skipped, 0 failed**.
+1. **Push the outstanding local fix, then re-sync Colab.** `tests/test_phase4.py::test_delta_matches_closed_form` has an uncommitted fix (`float(value.detach())`) for the `UserWarning` seen on the last Colab run. Commit and push it, then `git pull` on Colab and re-run the suite; expect **285 passed, 3 skipped, 0 failed, 0 warnings**. (`tests/test_phase5.py` memory-regime tests, `tests/test_phase3.py` warning fix, and `benchmarks/profile_scaling.py` are already pushed and confirmed on Colab as of the 282-passed run.)
+1a. **Review the `d4998d2` grid-tolerance change** (`1e-6 * dt` -> `1e-4 * dt` in `fused_expected_exposure`) before trusting it long-term — see the note under the milestone above. Either confirm the fp32-`linspace` explanation and record it, or tighten it back and fix the actual root cause.
 2. **Collect the headline numbers, which still do not exist.** All three benchmark harnesses have been written but never run on a GPU:
    - `benchmarks/profile_scaling.py` — peak VRAM and throughput vs M, labelled by regime. Start here: it is the cleanest evidence for the O(1)-in-M claim.
    - `benchmarks/bench_phase3.py` — fused vs pure PyTorch, time and peak VRAM.
