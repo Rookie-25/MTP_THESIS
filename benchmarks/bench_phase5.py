@@ -57,8 +57,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import gc
-import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,6 +67,17 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+from benchmarks._harness import (  # noqa: E402
+    BYTES_PER_GIB as _BYTES_PER_GIB,
+    BYTES_PER_MIB as _BYTES_PER_MIB,
+    Measurement,
+    VRAM_SAFETY_FRACTION,
+    free_vram_bytes,
+    is_oom as _is_oom,
+    measure,
+    reset_cuda as _reset_cuda,
+)
 
 from src.csrc.triton_cva_fusion import (  # noqa: E402
     DEFAULT_MAX_PROGRAMS,
@@ -87,9 +96,6 @@ RATE = 0.03
 SIGMA = 0.20
 MATURITY = 1.0
 
-_BYTES_PER_GIB = 1024.0**3
-_BYTES_PER_MIB = 1024.0**2
-
 #: Refuse a run needing more than this fraction of *free* VRAM.
 VRAM_SAFETY_FRACTION = 0.90
 
@@ -101,42 +107,6 @@ def portfolio() -> List[SwapLeg]:
         SwapLeg(notional=-0.4, strike=110.0, maturity=MATURITY),
         SwapLeg(notional=0.7, strike=95.0, maturity=0.5),
     ]
-
-
-def free_vram_bytes() -> int:
-    """Return currently free device memory in bytes (driver's view)."""
-    free, _total = torch.cuda.mem_get_info()
-    return int(free)
-
-
-@dataclass
-class Measurement:
-    """Timing and peak allocation for one backend at one problem size."""
-
-    milliseconds: Optional[float] = None
-    peak_bytes: Optional[int] = None
-    failed_oom: bool = False
-    predicted_oom: bool = False
-    predicted_bytes: Optional[int] = None
-
-    @property
-    def ok(self) -> bool:
-        return self.milliseconds is not None
-
-    @property
-    def skipped(self) -> bool:
-        return self.failed_oom or self.predicted_oom
-
-    @property
-    def peak_gib(self) -> Optional[float]:
-        return None if self.peak_bytes is None else self.peak_bytes / _BYTES_PER_GIB
-
-    @property
-    def predicted_gib(self) -> Optional[float]:
-        return (
-            None if self.predicted_bytes is None
-            else self.predicted_bytes / _BYTES_PER_GIB
-        )
 
 
 @dataclass
@@ -192,73 +162,6 @@ def predict_phase5_bytes(
     n_programs = min(n_blocks, max_programs)
     # Partial buffer, plus a handful of length-(N+1) vectors (B, C, weight, EE).
     return n_programs * (n_steps + 1) * element_size + 8 * (n_steps + 1) * element_size
-
-
-def _is_oom(error: BaseException) -> bool:
-    """Recognise an out-of-memory failure across PyTorch versions."""
-    if isinstance(error, torch.cuda.OutOfMemoryError):
-        return True
-    return isinstance(error, RuntimeError) and "out of memory" in str(error).lower()
-
-
-def _reset_cuda() -> None:
-    """Synchronise, drop cached blocks, and clear peak statistics."""
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.reset_accumulated_memory_stats()
-
-
-def measure(
-    operation: Callable[[], Optional[torch.Tensor]],
-    *,
-    repeats: int,
-    keep_output: bool,
-) -> Tuple[Measurement, Optional[torch.Tensor]]:
-    """Time ``operation`` on the CUDA stream and record its peak allocation.
-
-    Args:
-        operation: Zero-argument callable returning the EE profile (small) or
-            ``None``. It must release its own large tensors.
-        repeats: Timed iterations; the minimum is reported.
-        keep_output: Whether to retain the final profile for cross-checking.
-
-    Returns:
-        ``(measurement, profile_or_None)``.
-    """
-    try:
-        warm = operation()  # absorbs Triton JIT and allocator growth
-        torch.cuda.synchronize()
-        del warm
-        _reset_cuda()
-
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        best = math.inf
-        profile: Optional[torch.Tensor] = None
-        for index in range(repeats):
-            start.record()
-            result = operation()
-            end.record()
-            torch.cuda.synchronize()
-            best = min(best, start.elapsed_time(end))
-            if keep_output and index == repeats - 1 and result is not None:
-                profile = result.detach().clone()
-            del result
-
-        return (
-            Measurement(milliseconds=best, peak_bytes=torch.cuda.max_memory_allocated()),
-            profile,
-        )
-
-    except Exception as error:  # noqa: BLE001 - OOM is an expected outcome
-        if not _is_oom(error):
-            raise
-        _reset_cuda()
-        return Measurement(failed_oom=True), None
 
 
 def benchmark_one(
@@ -380,6 +283,8 @@ def benchmark_one(
 # ==========================================================================
 # Reporting
 # ==========================================================================
+
+
 def _time_cell(measurement: Measurement) -> str:
     if measurement.predicted_oom:
         return "OOM (pred)"
@@ -589,6 +494,8 @@ def write_csv(rows: Sequence[BenchmarkRow], destination: Path) -> None:
 # ==========================================================================
 # Entry point
 # ==========================================================================
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the CLI."""
     parser = argparse.ArgumentParser(

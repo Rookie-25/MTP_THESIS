@@ -637,6 +637,28 @@ def build_markdown(
     lines.append("## Where pure PyTorch stops")
     lines.append("")
 
+    # Survival matrix: the single clearest statement of the result. One row per
+    # path count, one column per backend, so the crossover is visible at a
+    # glance rather than inferred from two other tables.
+    lines.append("### Survival by path count")
+    lines.append("")
+    survival_rows = []
+    for row in rows:
+        cells = [f"{row.n_paths:,}"]
+        for backend in backends:
+            measurement = row.results.get(backend)
+            if measurement is None:
+                cells.append("not run")
+            elif measurement.ok:
+                cells.append(f"ok ({measurement.milliseconds:,.0f} ms)")
+            elif measurement.predicted_oom:
+                cells.append("**OOM**")
+            else:
+                cells.append("**OOM**")
+        survival_rows.append(cells)
+    lines.append(markdown_table(["M"] + list(backends), survival_rows))
+    lines.append("")
+
     first_baseline_oom = next(
         (
             row.n_paths

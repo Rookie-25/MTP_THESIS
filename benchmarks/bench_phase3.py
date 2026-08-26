@@ -52,7 +52,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import gc
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +63,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from benchmarks._harness import (  # noqa: E402
+    BYTES_PER_MIB as _BYTES_PER_MIB,
+    Measurement,
+    is_oom as _is_oom,
+    measure,
+    reset_cuda as _free_cuda_memory,
+)
+
 from src.csrc.triton_gbm import HAS_TRITON, is_available, triton_simulate_gbm  # noqa: E402
 from src.models.gbm import simulate_gbm  # noqa: E402
 
@@ -71,21 +78,6 @@ S0 = 100.0
 MU = 0.03
 SIGMA = 0.20
 MATURITY = 1.0
-
-_BYTES_PER_MIB = 1024.0 * 1024.0
-
-
-@dataclass
-class Measurement:
-    """Timing and memory for one backend at one problem size."""
-
-    milliseconds: Optional[float]
-    peak_mib: Optional[float]
-    failed_oom: bool = False
-
-    @property
-    def ok(self) -> bool:
-        return self.milliseconds is not None
 
 
 @dataclass
@@ -113,74 +105,6 @@ class BenchmarkRow:
         if not self.triton_result.peak_mib:
             return None
         return self.torch_result.peak_mib / self.triton_result.peak_mib
-
-
-def _is_oom(error: BaseException) -> bool:
-    """Recognise an out-of-memory failure across PyTorch versions."""
-    if isinstance(error, torch.cuda.OutOfMemoryError):
-        return True
-    return isinstance(error, RuntimeError) and "out of memory" in str(error).lower()
-
-
-def _free_cuda_memory() -> None:
-    """Return cached blocks to the driver so the next size starts clean."""
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-
-
-def measure(
-    operation: Callable[[], torch.Tensor],
-    *,
-    repeats: int,
-    keep_output: bool = False,
-) -> tuple[Measurement, Optional[torch.Tensor]]:
-    """Time ``operation`` on the CUDA stream and record its peak allocation.
-
-    Args:
-        operation: Zero-argument callable performing the work under test.
-        repeats: Number of timed iterations; the minimum is reported, since the
-            minimum is the cleanest estimate of achievable device time (larger
-            samples only add scheduler noise).
-        keep_output: Whether to return the final output tensor for a correctness
-            comparison.
-
-    Returns:
-        ``(measurement, output_or_None)``. On out-of-memory the measurement is
-        flagged and the output is ``None``.
-    """
-    try:
-        # Warm-up: absorbs Triton JIT compilation and allocator growth so they
-        # are not billed to the first timed iteration.
-        warm = operation()
-        torch.cuda.synchronize()
-        del warm
-
-        _free_cuda_memory()
-
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        best_ms = float("inf")
-        output: Optional[torch.Tensor] = None
-        for index in range(repeats):
-            start.record()
-            result = operation()
-            end.record()
-            torch.cuda.synchronize()
-            best_ms = min(best_ms, start.elapsed_time(end))
-            if keep_output and index == repeats - 1:
-                output = result.detach().clone()
-            del result
-
-        peak_mib = torch.cuda.max_memory_allocated() / _BYTES_PER_MIB
-        return Measurement(milliseconds=best_ms, peak_mib=peak_mib), output
-
-    except Exception as error:  # noqa: BLE001 - OOM is an expected outcome here
-        if not _is_oom(error):
-            raise
-        _free_cuda_memory()
-        return Measurement(milliseconds=None, peak_mib=None, failed_oom=True), None
 
 
 def benchmark_one(
@@ -263,6 +187,8 @@ def benchmark_one(
 # ==========================================================================
 # Reporting
 # ==========================================================================
+
+
 def _format_measurement_time(measurement: Measurement) -> str:
     if measurement.failed_oom:
         return "OOM"
@@ -425,6 +351,8 @@ def write_csv(rows: Sequence[BenchmarkRow], destination: Path) -> None:
 # ==========================================================================
 # Entry point
 # ==========================================================================
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the CLI."""
     parser = argparse.ArgumentParser(

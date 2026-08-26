@@ -38,8 +38,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import gc
-import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +48,16 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+from benchmarks._harness import (  # noqa: E402
+    BYTES_PER_GIB as _GIB,
+    BYTES_PER_MIB as _MIB,
+    VRAM_SAFETY_FRACTION,
+    free_vram_bytes,
+    is_oom,
+    measure as _harness_measure,
+    reset_cuda as _reset_cuda,
+)
 
 from src.csrc.triton_cva_fusion import (  # noqa: E402
     DEFAULT_MAX_PROGRAMS,
@@ -64,10 +72,6 @@ MU = 0.05
 RATE = 0.03
 SIGMA = 0.20
 MATURITY = 1.0
-
-_MIB = 1024.0**2
-_GIB = 1024.0**3
-VRAM_SAFETY_FRACTION = 0.90
 
 
 def default_portfolio() -> List[SwapLeg]:
@@ -105,15 +109,6 @@ class Row:
 
 # Set once in main(); keeps `throughput` a property without threading N through.
 N_STEPS_HOLDER = [252]
-
-
-def _reset_cuda() -> None:
-    """Synchronise, drop cached blocks, clear peak statistics."""
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
 
 
 def measure(
@@ -164,7 +159,7 @@ def measure(
             reason=f"predicted {predicted / _MIB:,.1f} MiB > budget",
         )
 
-    def run() -> None:
+    def run():
         if include_backward:
             s0 = torch.tensor(S0, device=device, dtype=dtype, requires_grad=True)
             sigma = torch.tensor(SIGMA, device=device, dtype=dtype, requires_grad=True)
@@ -180,34 +175,21 @@ def measure(
                     seed=seed, max_programs=max_programs,
                 )
 
-    try:
-        run()  # warm-up: absorbs Triton JIT and allocator growth
-        torch.cuda.synchronize()
-        _reset_cuda()
+    # Timing and peak-memory bookkeeping live in the shared harness, so every
+    # benchmark in this directory measures identically -- a prerequisite for
+    # combining their numbers into one table.
+    result, _output = _harness_measure(run, repeats=repeats)
+    _reset_cuda()
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        best = math.inf
-        for _ in range(repeats):
-            start.record()
-            run()
-            end.record()
-            torch.cuda.synchronize()
-            best = min(best, start.elapsed_time(end))
-
-        peak = torch.cuda.max_memory_allocated()
-        _reset_cuda()
+    if not result.ok:
         return Row(
             n_paths=n_paths, n_programs=n_programs, saturated=saturated,
-            milliseconds=best, peak_bytes=peak,
+            skipped=True, reason=result.note or "out of memory",
         )
-
-    except torch.cuda.OutOfMemoryError:
-        _reset_cuda()
-        return Row(
-            n_paths=n_paths, n_programs=n_programs, saturated=saturated,
-            skipped=True, reason="out of memory",
-        )
+    return Row(
+        n_paths=n_paths, n_programs=n_programs, saturated=saturated,
+        milliseconds=result.milliseconds, peak_bytes=result.peak_bytes,
+    )
 
 
 def render(rows: Sequence[Row], n_steps: int, element_size: int) -> str:
