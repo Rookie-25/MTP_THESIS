@@ -16,6 +16,14 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+# Converting a graph-attached tensor to a Python scalar is always a mistake in
+# this codebase (it silently keeps the autograd graph alive and warns on newer
+# PyTorch builds). Promote it to a failure so it cannot accumulate unnoticed --
+# older builds that stay silent are covered by the STRICT_TENSOR_SCALAR hook in
+# tests/conftest.py instead.
+filterwarnings = [
+    "error:Converting a tensor with requires_grad=True to a scalar:UserWarning",
+]
 
 [tool.black]
 line-length = 100

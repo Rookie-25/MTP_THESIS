@@ -187,9 +187,13 @@ class TestStructuralGuarantees:
                 surface.raw_rho.copy_(torch.randn((), generator=generator) * 10)
                 surface.raw_eta.copy_(torch.randn((), generator=generator) * 10)
                 surface.raw_gamma.copy_(torch.randn((), generator=generator) * 10)
-            assert -1.0 < float(surface.rho) < 1.0
-            assert float(surface.eta) > 0.0
-            assert 0.0 < float(surface.gamma) < 1.0
+            # `.detach()` before the scalar conversion: rho/eta/gamma are
+            # computed from nn.Parameters, so they carry requires_grad=True even
+            # though nothing here needs a gradient. Converting a graph-attached
+            # tensor to a Python float warns on newer PyTorch builds.
+            assert -1.0 < surface.rho.detach().item() < 1.0
+            assert surface.eta.detach().item() > 0.0
+            assert 0.0 < surface.gamma.detach().item() < 1.0
 
     def test_calendar_slope_is_non_negative_on_a_calibrated_surface(self) -> None:
         surface = _surface()
