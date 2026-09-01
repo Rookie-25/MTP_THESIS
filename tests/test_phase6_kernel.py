@@ -346,6 +346,128 @@ class TestGracefulDegradation:
 # ==========================================================================
 # Tier 2 -- the kernels (GPU only)
 # ==========================================================================
+class TestAtTheMoneyKink:
+    r"""The t=0 exposure kink when a trade is struck exactly at-the-money.
+
+    This is not a defect, but it *looks* like one and cost a debugging round, so
+    it is pinned down here.
+
+    ``EE[0]`` is deterministic: every path starts at :math:`S_0`, so
+    :math:`V_0 = B_0 S_0 - C_0` is the same on all of them. When the strike
+    equals the spot, :math:`C_0 = B_0 \cdot \text{strike} = B_0 S_0`, so
+    :math:`V_0 = 0` **exactly** -- not approximately. ``max(V, 0)`` has no
+    derivative there.
+
+    For :math:`t > 0` this cannot happen with probability one, because the state
+    is diffusive and :math:`\{V_t = 0\}` is a null set. The :math:`t=0` column
+    is the sole exception, and it is exactly the case a desk hits when it books
+    a fresh at-the-money trade.
+
+    Consequences, both measured below:
+
+    * AAD returns the subgradient ``0`` (PyTorch's ``clamp`` convention, used
+      consistently across this codebase).
+    * Central finite differences return the mean of the two one-sided
+      derivatives, i.e. half the jump.
+
+    They therefore differ by a **fixed absolute amount independent of N** --
+    which is the signature to look for. Relative error then just scales as
+    (that constant) / |gradient|, which is why the same underlying discrepancy
+    showed up as 1.7%, 3.4% and 76.8% at different step counts.
+    """
+
+    @staticmethod
+    def _probe(strike: float, n_steps: int = 64, n_paths: int = 1_000):
+        """Return ``(v0, aad, fd)`` for the spot gradient at a given strike."""
+        from src.csrc.triton_cva_fusion import build_affine_coefficients
+        from src.pricer.options import SwapLeg
+
+        rate, dt = 0.03, MATURITY / n_steps
+        times = torch.linspace(0.0, MATURITY, n_steps + 1)
+        legs = [SwapLeg(notional=1.0, strike=strike, maturity=MATURITY)]
+        coeff_b, coeff_c = build_affine_coefficients(legs, times, rate)
+
+        generator = torch.Generator().manual_seed(SEED + 7)
+        normals = torch.randn((n_paths, n_steps), generator=generator)
+        weights = torch.randn(n_steps + 1, generator=generator)
+
+        spot = torch.tensor(SPOT, requires_grad=True)
+        profile = reference_local_vol_ee(
+            spot, torch.tensor(DRIFT), torch.tensor(BASE), torch.tensor(SKEW),
+            normals, dt, coeff_b, coeff_c, PARAMS,
+        )
+        (weights * profile).sum().backward()
+        aad = float(spot.grad)
+
+        step = 1e-6 * SPOT
+        with torch.no_grad():
+            def evaluate(value: float) -> float:
+                return float((weights * reference_local_vol_ee(
+                    torch.tensor(value), torch.tensor(DRIFT),
+                    torch.tensor(BASE), torch.tensor(SKEW),
+                    normals, dt, coeff_b, coeff_c, PARAMS,
+                )).sum())
+
+            finite = (evaluate(SPOT + step) - evaluate(SPOT - step)) / (2.0 * step)
+
+        v0 = float(coeff_b[0]) * SPOT - float(coeff_c[0])
+        return v0, aad, finite
+
+    def test_at_the_money_puts_t0_exposure_exactly_on_the_kink(self) -> None:
+        """``strike == spot`` gives ``V[0] == 0`` to the bit, not merely near it."""
+        v0, _, _ = self._probe(strike=SPOT)
+        assert v0 == 0.0, f"expected exactly zero, got {v0!r}"
+
+    @pytest.mark.parametrize("strike", [90.0, 95.0, 105.0, 110.0])
+    def test_away_from_the_money_aad_and_fd_agree(self, strike: float) -> None:
+        """Off the kink, the two methods agree to machine precision."""
+        v0, aad, finite = self._probe(strike=strike)
+        assert abs(v0) > 1e-6, "this strike should not be at-the-money"
+        assert math.isclose(aad, finite, rel_tol=1e-6), (
+            f"strike={strike}: AAD {aad!r} vs FD {finite!r}"
+        )
+
+    def test_on_the_kink_they_disagree_and_that_is_expected(self) -> None:
+        """At-the-money they differ -- by design, not by defect."""
+        v0, aad, finite = self._probe(strike=SPOT)
+        assert v0 == 0.0
+        assert not math.isclose(aad, finite, rel_tol=5e-3), (
+            "expected AAD and FD to differ on the kink; if they now agree, the "
+            "clamp subgradient convention changed and this test needs revisiting"
+        )
+
+    @pytest.mark.parametrize("n_steps", [16, 32, 64])
+    def test_the_kink_gap_is_a_constant_independent_of_n(self, n_steps: int) -> None:
+        r"""The signature that identifies this as a kink rather than a bug.
+
+        The disagreement comes entirely from the single :math:`t=0` column, so
+        its absolute size is :math:`\tfrac12 w_0 B_0` -- independent of the
+        number of time steps. A recursion bug would instead scale with
+        :math:`N`.
+        """
+        _, aad, finite = self._probe(strike=SPOT, n_steps=n_steps)
+        gap = finite - aad
+
+        # Reconstruct the predicted half-jump from the t=0 column alone.
+        from src.csrc.triton_cva_fusion import build_affine_coefficients
+        from src.pricer.options import SwapLeg
+
+        times = torch.linspace(0.0, MATURITY, n_steps + 1)
+        coeff_b, _ = build_affine_coefficients(
+            [SwapLeg(notional=1.0, strike=SPOT, maturity=MATURITY)], times, 0.03
+        )
+        generator = torch.Generator().manual_seed(SEED + 7)
+        _ = torch.randn((1_000, n_steps), generator=generator)
+        weights = torch.randn(n_steps + 1, generator=generator)
+        predicted = 0.5 * float(weights[0]) * float(coeff_b[0])
+
+        assert math.isclose(abs(gap), abs(predicted), rel_tol=0.02), (
+            f"N={n_steps}: gap {gap:.6e} vs predicted half-jump "
+            f"{predicted:.6e} -- if these stop matching, the discrepancy is no "
+            "longer explained by the t=0 kink alone"
+        )
+
+
 @requires_triton
 class TestKernelForward:
     """Forward parity against the CPU reference at M = 1000."""
@@ -463,12 +585,30 @@ class TestKernelGradients:
 
     @staticmethod
     def _setup(n_steps: int):
+        """Build the grid, netting set and functional weights.
+
+        The strike is deliberately **not** equal to ``SPOT``. With
+        ``strike == spot`` the t=0 exposure is
+
+            V[0] = B[0]*S0 - C[0] = B[0]*S0 - B[0]*strike = 0   exactly,
+
+        which sits precisely on the ``max(V, 0)`` kink. There is no derivative
+        there: AAD returns the subgradient 0 while central differences return
+        the average of the two one-sided derivatives, and they disagree by half
+        the jump -- a fixed absolute amount, regardless of N. That is a property
+        of the function, not a kernel bug, and it is measured and documented in
+        ``TestAtTheMoneyKink`` below.
+
+        Unlike t > 0, where ``{V_t = 0}`` is a null set under the diffusion, the
+        t=0 state is deterministic, so an at-the-money strike puts the kink on
+        the sample with probability one.
+        """
         from src.pricer.options import SwapLeg
 
         times = torch.linspace(
             0.0, MATURITY, n_steps + 1, device="cuda", dtype=torch.float64
         )
-        legs = [SwapLeg(notional=1.0, strike=100.0, maturity=MATURITY)]
+        legs = [SwapLeg(notional=1.0, strike=95.0, maturity=MATURITY)]
         generator = torch.Generator(device="cuda").manual_seed(SEED + 7)
         weights = torch.randn(
             n_steps + 1, device="cuda", dtype=torch.float64, generator=generator
@@ -576,9 +716,12 @@ class TestKernelGradients:
         assert not mismatched, (
             f"{len(mismatched)} of 4 gradients disagree with finite differences "
             f"({', '.join(mismatched)}).\n{table}\n"
-            "  If ONLY 'spot' disagrees, the adjoint recursion is sound and the\n"
-            "  fault is in the final adjoint read or the /s0 scaling.\n"
-            "  If ALL FOUR disagree, the recursion itself is mistranslated."
+            "  If ONLY 'spot' disagrees by a FIXED ABSOLUTE amount that does not\n"
+            "  change with N, suspect a kink: check whether V[0] = B[0]*S0 - C[0]\n"
+            "  is zero, which makes the t=0 derivative undefined (see\n"
+            "  TestAtTheMoneyKink). If it varies with N, the recursion or the\n"
+            "  final adjoint read is at fault. If ALL FOUR disagree, the\n"
+            "  recursion itself is mistranslated."
         )
 
     @pytest.mark.parametrize("n_steps", [16, 63, 64, 100])
