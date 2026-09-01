@@ -475,48 +475,150 @@ class TestKernelGradients:
         )
         return times, legs, weights
 
-    def test_gradients_match_central_differences(self) -> None:
-        r"""AAD vs finite differences under common random numbers.
+    @staticmethod
+    def _aad_and_fd(
+        legs, times, weights, n_paths: int, n_steps: int, step_rel: float = 1e-6
+    ):
+        """Return ``{param: (aad, fd)}`` for all four parameters.
 
-        The seed pins the sample, so a bump redraws identical normals and FD is
-        a valid oracle. The exposure floor makes the functional only piecewise
-        smooth, so FD carries an :math:`O(h)` kink bias -- hence a relative
-        rather than machine-precision tolerance.
+        Deliberately evaluates **every** parameter before asserting anything.
+        An assertion inside the loop short-circuits on the first failure, which
+        hides whether the others agree -- and that is exactly the information
+        needed to localise a backward bug.
         """
-        times, legs, weights = self._setup(self.N_STEPS)
+        import math as _math
 
-        spot = torch.tensor(SPOT, device="cuda", dtype=torch.float64, requires_grad=True)
-        drift = torch.tensor(DRIFT, device="cuda", dtype=torch.float64, requires_grad=True)
-        base = torch.tensor(BASE, device="cuda", dtype=torch.float64, requires_grad=True)
-        skew = torch.tensor(SKEW, device="cuda", dtype=torch.float64, requires_grad=True)
-
-        self._functional(
-            spot, drift, base, skew, legs, times, self.N_PATHS, weights
-        ).backward()
-        aad = {
-            "spot": float(spot.grad), "drift": float(drift.grad),
-            "base": float(base.grad), "skew": float(skew.grad),
+        leaves = {
+            "spot": torch.tensor(SPOT, device="cuda", dtype=torch.float64,
+                                 requires_grad=True),
+            "drift": torch.tensor(DRIFT, device="cuda", dtype=torch.float64,
+                                  requires_grad=True),
+            "base": torch.tensor(BASE, device="cuda", dtype=torch.float64,
+                                 requires_grad=True),
+            "skew": torch.tensor(SKEW, device="cuda", dtype=torch.float64,
+                                 requires_grad=True),
         }
+        TestKernelGradients._functional(
+            leaves["spot"], leaves["drift"], leaves["base"], leaves["skew"],
+            legs, times, n_paths, weights,
+        ).backward()
+        aad = {name: float(leaf.grad) for name, leaf in leaves.items()}
 
         nominal = {"spot": SPOT, "drift": DRIFT, "base": BASE, "skew": SKEW}
+        finite = {}
         for name in ("spot", "drift", "base", "skew"):
-            step = 1e-6 * max(abs(nominal[name]), 1.0)
+            step = step_rel * max(abs(nominal[name]), 1.0)
             with torch.no_grad():
                 up, down = dict(nominal), dict(nominal)
                 up[name] = nominal[name] + step
                 down[name] = nominal[name] - step
-                value_up = float(self._functional(
+                value_up = float(TestKernelGradients._functional(
                     up["spot"], up["drift"], up["base"], up["skew"],
-                    legs, times, self.N_PATHS, weights,
+                    legs, times, n_paths, weights,
                 ))
-                value_down = float(self._functional(
+                value_down = float(TestKernelGradients._functional(
                     down["spot"], down["drift"], down["base"], down["skew"],
-                    legs, times, self.N_PATHS, weights,
+                    legs, times, n_paths, weights,
                 ))
-            finite_difference = (value_up - value_down) / (2.0 * step)
-            assert math.isclose(
-                aad[name], finite_difference, rel_tol=5e-3, abs_tol=1e-9
-            ), f"{name}: AAD {aad[name]!r} vs FD {finite_difference!r}"
+            finite[name] = (value_up - value_down) / (2.0 * step)
+
+        del _math
+        return {name: (aad[name], finite[name]) for name in aad}
+
+    @staticmethod
+    def _format_comparison(results, header: str = "") -> str:
+        """Render an AAD-vs-FD table, with the ratio -- patterns are diagnostic.
+
+        A clean 2x, 0.5x or 1/N ratio points at a specific structural mistake;
+        a ragged ratio points at something sample-dependent.
+        """
+        lines = [header] if header else []
+        lines.append(
+            f"  {'param':<8}{'AAD':>20}{'FD':>20}{'FD/AAD':>10}{'rel err':>11}"
+        )
+        lines.append("  " + "-" * 67)
+        for name in ("spot", "drift", "base", "skew"):
+            aad, fd = results[name]
+            ratio = fd / aad if abs(aad) > 1e-300 else float("nan")
+            relative = abs(fd - aad) / max(abs(aad), 1e-300)
+            flag = "" if relative < 5e-3 else "   <-- MISMATCH"
+            lines.append(
+                f"  {name:<8}{aad:>20.10e}{fd:>20.10e}{ratio:>10.4f}"
+                f"{relative:>11.2%}{flag}"
+            )
+        return "\n".join(lines)
+
+    def test_gradients_match_central_differences(self) -> None:
+        r"""AAD vs finite differences under common random numbers.
+
+        The seed pins the sample, so a bump redraws identical normals and FD is
+        a valid oracle here. That is not an assumption: on the CPU reference --
+        itself verified against ``torch.autograd`` to 1e-9 -- AAD and FD agree
+        to 0.0% at this path count across step sizes 1e-3 to 1e-7. So a
+        disagreement on the kernel is a kernel bug, not FD noise.
+
+        All four parameters are evaluated and reported together before any
+        assertion, so a failure shows the full picture rather than stopping at
+        whichever happens to be checked first.
+        """
+        times, legs, weights = self._setup(self.N_STEPS)
+        results = self._aad_and_fd(legs, times, weights, self.N_PATHS, self.N_STEPS)
+
+        table = self._format_comparison(
+            results, f"AAD vs FD  (M={self.N_PATHS:,}, N={self.N_STEPS})"
+        )
+        print("\n" + table)
+
+        mismatched = [
+            name for name, (aad, fd) in results.items()
+            if not math.isclose(aad, fd, rel_tol=5e-3, abs_tol=1e-9)
+        ]
+        assert not mismatched, (
+            f"{len(mismatched)} of 4 gradients disagree with finite differences "
+            f"({', '.join(mismatched)}).\n{table}\n"
+            "  If ONLY 'spot' disagrees, the adjoint recursion is sound and the\n"
+            "  fault is in the final adjoint read or the /s0 scaling.\n"
+            "  If ALL FOUR disagree, the recursion itself is mistranslated."
+        )
+
+    @pytest.mark.parametrize("n_steps", [16, 63, 64, 100])
+    def test_gradient_agreement_across_checkpoint_geometries(
+        self, n_steps: int
+    ) -> None:
+        """Diagnostic: does the error track the checkpoint geometry?
+
+        ``BLOCK_CK`` is derived from ``sqrt(n_steps)``, so these four cases give
+        different segment layouts -- and crucially ``n_steps=63`` does **not**
+        divide evenly by its ``BLOCK_CK=8``, leaving a partial final segment
+        that exercises the ``live`` masking. ``n_steps=64`` divides exactly and
+        never touches that path.
+
+        If the error appears only for non-multiples, the bug is in the segment
+        boundary handling. If it is uniform, the bug is in the recursion or the
+        final read.
+        """
+        from src.csrc.triton_local_vol_cva import select_local_vol_blocks
+
+        block_m, block_ck = select_local_vol_blocks(n_steps, 8)
+        n_segments = -(-n_steps // block_ck)
+        divides_evenly = n_steps % block_ck == 0
+
+        times, legs, weights = self._setup(n_steps)
+        results = self._aad_and_fd(legs, times, weights, self.N_PATHS, n_steps)
+
+        table = self._format_comparison(
+            results,
+            f"N={n_steps}  BLOCK_M={block_m}  BLOCK_CK={block_ck}  "
+            f"segments={n_segments}  "
+            f"{'exact' if divides_evenly else 'PARTIAL final segment'}",
+        )
+        print("\n" + table)
+
+        mismatched = [
+            name for name, (aad, fd) in results.items()
+            if not math.isclose(aad, fd, rel_tol=5e-3, abs_tol=1e-9)
+        ]
+        assert not mismatched, f"{', '.join(mismatched)} disagree\n{table}"
 
     def test_all_gradients_are_nonzero(self) -> None:
         """Guard the guard: a zero Greek makes the FD check vacuous."""
