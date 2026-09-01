@@ -107,6 +107,8 @@ __all__ = [
     "potential_future_exposure",
     "expected_positive_exposure",
     "compute_exposure_profile",
+    "GRID_UNIFORMITY_EPS_FACTOR",
+    "validate_uniform_grid",
     "mpor_lag_steps",
     "collateral_required",
     "collateral_balance",
@@ -114,6 +116,12 @@ __all__ = [
     "expected_collateralized_exposure",
     "compute_collateralized_exposure_profile",
 ]
+
+#: How many machine epsilons of the *horizon* a grid may deviate from uniform.
+#: 64 leaves ~2 decimal digits of headroom over the worst measured linspace
+#: rounding (0.61 eps at float32, N=1000) while still rejecting a real
+#: perturbation by orders of magnitude.
+GRID_UNIFORMITY_EPS_FACTOR = 64.0
 
 #: A scalar model input may be a Python float or a 0-dim tensor (the latter
 #: when a gradient with respect to it is wanted).
@@ -653,6 +661,32 @@ def collateral_required(
 def _grid_step(times: Tensor) -> float:
     """Return the uniform step of ``times``, validating uniformity.
 
+    The uniformity test is **relative to the horizon, not to the step**.
+
+    A grid built by ``torch.linspace`` is not exactly uniform in floating point:
+    the time values are :math:`O(T)`, so each carries a rounding error of order
+    :math:`\\epsilon T`, and the differences between consecutive steps inherit
+    it. That error is *independent of* :math:`N`. Testing it against
+    :math:`\\Delta t = T/N` therefore injects a spurious factor of :math:`N`,
+    and any fixed ``rel_tol * dt`` bound fails once :math:`N` is large enough.
+
+    Measured on ``torch.linspace(0, 1, N+1)``, worst deviation over step:
+
+    ==========  ============  ============
+    N           float32       float64
+    ==========  ============  ============
+    252         1.1e-05       2.4e-14
+    1000        7.3e-05       1.1e-13
+    2520        9.4e-05       2.8e-13
+    10000       4.3e-04       1.0e-12
+    ==========  ============  ============
+
+    So a ``1e-6 * dt`` bound rejects a perfectly good float32 grid from
+    :math:`N \\approx 100`, and even ``1e-4 * dt`` breaks by
+    :math:`N \\approx 2700`. Bounding against :math:`\\epsilon T` instead is
+    :math:`N`-independent and dtype-aware, and still rejects a genuinely
+    non-uniform grid by many orders of magnitude.
+
     Args:
         times: Observation grid of shape ``(n_steps + 1,)``.
 
@@ -660,8 +694,9 @@ def _grid_step(times: Tensor) -> float:
         The step size in years.
 
     Raises:
-        ValueError: If the grid has fewer than two points or is not uniform to
-            within a relative tolerance of ``1e-9``.
+        ValueError: If the grid has fewer than two points, is not strictly
+            increasing, or deviates from uniform by more than
+            ``GRID_UNIFORMITY_EPS_FACTOR`` machine epsilons of the horizon.
     """
     if times.ndim != 1 or times.shape[0] < 2:
         raise ValueError("times must be a 1-D grid with at least two points")
@@ -669,11 +704,34 @@ def _grid_step(times: Tensor) -> float:
     dt = float(steps[0])
     if dt <= 0.0:
         raise ValueError("times must be strictly increasing")
-    if float((steps - steps[0]).abs().max()) > 1e-9 * dt:
+
+    horizon = abs(float(times[-1] - times[0]))
+    epsilon = torch.finfo(times.dtype).eps
+    tolerance = GRID_UNIFORMITY_EPS_FACTOR * epsilon * max(horizon, 1.0)
+    deviation = float((steps - steps[0]).abs().max())
+    if deviation > tolerance:
         raise ValueError(
-            "collateral modelling assumes a uniform time grid; got non-uniform spacing"
+            "a uniform time grid is required; worst step deviation "
+            f"{deviation:.3e} exceeds {tolerance:.3e} "
+            f"({GRID_UNIFORMITY_EPS_FACTOR} x eps x horizon for "
+            f"{times.dtype})"
         )
     return dt
+
+
+def validate_uniform_grid(times: Tensor) -> float:
+    """Public alias of the canonical grid check.
+
+    Args:
+        times: Observation grid of shape ``(n_steps + 1,)``.
+
+    Returns:
+        The uniform step size in years.
+
+    Raises:
+        ValueError: If the grid is not uniform. See :func:`_grid_step`.
+    """
+    return _grid_step(times)
 
 
 def collateral_balance(mtm: Tensor, times: Tensor, terms: CSATerms) -> Tensor:

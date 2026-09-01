@@ -921,3 +921,62 @@ class TestCSAPlumbing:
         bad_times[3] = bad_times[3] + 0.001
         with pytest.raises(ValueError, match="uniform"):
             collateral_balance(csa_mtm, bad_times, CSATerms(margin_period_of_risk=MPOR_10BD))
+
+
+class TestGridUniformityTolerance:
+    """The uniformity check must be horizon-relative, not step-relative.
+
+    Regression cover for a real bug. The original bound was ``1e-6 * dt``, which
+    rejects a perfectly good ``torch.linspace`` grid in float32 from about
+    N=100 -- linspace rounding is ``O(eps * T)`` and independent of N, so
+    dividing by ``dt = T/N`` injects a spurious factor of N. It was patched to
+    ``1e-4 * dt``, which merely moves the failure to about N=2700.
+    """
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    @pytest.mark.parametrize("n_steps", [2, 32, 100, 252, 1_000, 2_520, 10_000])
+    @pytest.mark.parametrize("horizon", [0.25, 1.0, 10.0, 30.0])
+    def test_linspace_grids_are_always_accepted(
+        self, dtype: torch.dtype, n_steps: int, horizon: float
+    ) -> None:
+        """No legitimate linspace grid may be rejected, at any N, T or dtype."""
+        from src.xva.exposure import validate_uniform_grid
+
+        times = torch.linspace(0.0, horizon, n_steps + 1, dtype=dtype)
+        step = validate_uniform_grid(times)
+        assert step == pytest.approx(horizon / n_steps, rel=1e-4)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_genuinely_non_uniform_grid_is_still_rejected(
+        self, dtype: torch.dtype
+    ) -> None:
+        """Loosening the bound must not blind it to a real violation."""
+        from src.xva.exposure import validate_uniform_grid
+
+        times = torch.linspace(0.0, 1.0, 253, dtype=dtype).clone()
+        times[5] = times[5] + 1e-4
+        with pytest.raises(ValueError, match="uniform time grid"):
+            validate_uniform_grid(times)
+
+    def test_the_old_step_relative_bound_would_have_failed(self) -> None:
+        """Document why the formulation changed, not just that it did.
+
+        Asserts the arithmetic directly: a float32 linspace at N=252 deviates by
+        more than ``1e-6 * dt``, so the original bound rejected valid input.
+        """
+        times = torch.linspace(0.0, 1.0, 253, dtype=torch.float32)
+        steps = times[1:] - times[:-1]
+        deviation = float((steps - steps[0]).abs().max())
+        step = float(steps[0])
+
+        assert deviation > 1e-6 * step, "the old bound would have passed here"
+        # ...and the horizon-relative bound comfortably accepts it.
+        assert deviation < 64 * torch.finfo(torch.float32).eps * 1.0
+
+    def test_rejects_decreasing_and_degenerate_grids(self) -> None:
+        from src.xva.exposure import validate_uniform_grid
+
+        with pytest.raises(ValueError, match="at least two points"):
+            validate_uniform_grid(torch.tensor([0.0]))
+        with pytest.raises(ValueError, match="strictly increasing"):
+            validate_uniform_grid(torch.tensor([1.0, 0.5, 0.0]))

@@ -178,6 +178,7 @@ from torch import Tensor
 
 from src.csrc.triton_gbm import HAS_TRITON, is_available
 from src.csrc.triton_philox_gbm import validate_offset_scheme
+from src.xva.exposure import validate_uniform_grid
 
 __all__ = [
     "DEFAULT_MAX_PROGRAMS",
@@ -873,12 +874,11 @@ def fused_expected_exposure(
     if not times.is_cuda:
         raise ValueError("times must be a CUDA tensor; the fused kernel is GPU-only")
 
-    steps = (times[1:] - times[:-1]).detach()
-    dt = float(steps[0])
-    if dt <= 0.0:
-        raise ValueError("times must be strictly increasing")
-    if float((steps - steps[0]).abs().max()) > 1e-4 * dt:
-        raise ValueError("the fused kernel assumes a uniform time grid")
+    # Canonical horizon-relative uniformity check. A `rel_tol * dt` bound is
+    # the wrong shape: linspace rounding is O(eps * T) and independent of N, so
+    # dividing by dt = T/N injects a factor of N and the bound fails for large
+    # N. See src/xva/exposure.py::_grid_step for the measurements.
+    dt = validate_uniform_grid(times)
 
     device, dtype = times.device, times.dtype
     coeff_b, coeff_c = build_affine_coefficients(legs, times, float(rate))

@@ -1,7 +1,10 @@
 # PROJECT_STATE.md
 
 **Project:** GPU-Native Differentiable AAD Monte-Carlo XVA & Greeks Engine with Neural-SDE / Rough-Volatility Calibration
-**Last updated:** 2026-08-21 (GPU TIER VERIFIED ON COLAB)
+**Status source of truth:** this file. It carries no date on purpose -- a
+date invites trusting it past its shelf life. Verify against the repo with
+`git log --oneline -10` and `python -m pytest tests/ -q` before relying on
+any claim below.
 
 ---
 
@@ -19,7 +22,7 @@ All Phase 2 deliverables are implemented, tested and benchmarked: exposure profi
 
 **Phase 5 (Month 4) — Fused payoff/exposure reduction, O(1)-in-M memory: COMPLETE AND GPU-VERIFIED.**
 
-**Phase 6 (Month 5) — Arbitrage-free local volatility + non-linear adjoint: MATH COMPLETE (CPU-verified), kernel SPECIFIED BUT NOT WRITTEN.**
+**Phase 6 (Month 5) — Local volatility + non-linear adjoint: MATHS CPU-VERIFIED; KERNEL WRITTEN, NEVER EXECUTED.**
 
 Phase 3 has a fused Triton GBM kernel with a hand-derived adjoint. Phase 4 removes the caller-supplied `dW` matrix entirely by generating increments in-kernel from a counter-based (Philox) RNG, and rematerialises them in the backward pass instead of storing them.
 
@@ -27,9 +30,11 @@ Phase 3 has a fused Triton GBM kernel with a hand-derived adjoint. Phase 4 remov
 
 Result, first run: 280 passed, 3 skipped, 1 failed of 284. The 3 skips are the inverse-condition `test_helper_raises_actionable_error` guards (correctly skipped *because* Triton is present). The 1 failure was a bug in one of my tests, not in any kernel (see "GPU findings" below) — fixed, re-run confirmed **282 passed, 3 skipped, 0 failed of 285** (one test added by the fix).
 
-**Outstanding, not yet re-verified on Colab (local fix, not pushed as of last sync):** a `UserWarning` in `tests/test_phase4.py::test_delta_matches_closed_form` — `float(value)` was converting a still-graph-attached tensor to a scalar. An earlier attempted fix (commit `8185c6a`, `s0.grad.item()`) did not address it, since the warning came from `value`, not `s0.grad`. Corrected locally to `float(value.detach())`; needs a push + Colab re-run to confirm **285 passed, 0 warnings**.
+**RESOLVED — graph-attached scalar conversions.** Three sites converted a `requires_grad` tensor to a Python scalar, warning on Colab's PyTorch but silent on the local 2.4.0 build. That version gap made them cost three separate round-trips to find. A static scan flagged 115 candidate conversions across `tests/`, but a runtime detector showed only **3** genuinely involved a `requires_grad` tensor — blanket-detaching the rest would have been churn.
 
-**Undocumented change made directly against the repo (commit `d4998d2`), flagged here for review:** the uniform-time-grid tolerance in `fused_expected_exposure` (`src/csrc/triton_cva_fusion.py`) was loosened from `1e-6 * dt` to `1e-4 * dt` — a 100x relaxation of a correctness guard. No reasoning was recorded. Plausible explanation: `torch.linspace` in fp32 on the T4 produced grid spacing that failed the tighter bound. Worth a deliberate look before relying on it — a guard against a non-uniform grid is exactly the kind of check that should stay tight, since the collateral/MPOR machinery in Phase 2 depends on grid uniformity too.
+Two guards now make the class unrepeatable: `pyproject.toml` promotes PyTorch's own warning to an *error*, and `tests/conftest.py` adds an opt-in, version-independent detector (`STRICT_TENSOR_SCALAR=1`) that patches `Tensor.__float__`/`.item` and reports file, line and source for every graph-attached conversion. Verified by reintroducing the bug and confirming it is flagged.
+
+**RESOLVED — the `d4998d2` grid tolerance.** Investigated and re-formulated; see "FIXED: the grid-uniformity tolerance was mis-formulated" below. Short version: the loosening was a *necessary* bug fix (the original bound rejected valid float32 grids from N~100), but `1e-4 * dt` was itself the wrong shape and would have broken again by N~2700. The check is now horizon-relative, N-independent, and lives in exactly one place.
 
 What this converts from conjecture to measurement:
 
@@ -38,7 +43,9 @@ What this converts from conjecture to measurement:
 - **The int64 addressing fix works.** `TestGlobalPointerAddressing` all green, and the >8.5M-path runs that previously died with `illegal memory access` now complete.
 - **Phase 5 fused reduction** — `test_ee_matches_unfused_within_sampling_error`, `test_cva_matches_unfused_within_sampling_error`, `test_grid_size_does_not_change_the_result` (confirming the absolute-block-index Philox keying decouples results from grid size), `TestFusedGreeks::test_greeks_match_central_differences`, `test_credit_sensitivity_matches_closed_form`, and `test_backward_memory_is_also_independent_of_m`.
 
-Local suite (CPU tier only, no Triton on Windows): **219 passed, 66 skipped**.
+Local suite (CPU tier only, no Triton on Windows): **321 passed, 75 skipped**.
+The 75 skips are GPU-tier tests; they run and pass on Colab except the 9
+Phase 6 kernel tests, which have never executed anywhere.
 
 ## Files created/modified
 
@@ -95,6 +102,15 @@ xva-cuda-engine/
 │   │                              #   FusedGBMFunction (autograd.Function, once_differentiable)
 │   │                              #   triton_simulate_gbm (drop-in for simulate_gbm)
 │   │                              #   select_block_sizes, is_available, HAS_TRITON
+│   │       triton_local_vol_cva.py # -------- PHASE 6 -------- local-vol kernel (UNRUN):
+│   │                              #   _fused_local_vol_forward_kernel  (sequential time loop,
+│   │                              #     NOT tl.cumsum -- sigma is state-dependent)
+│   │                              #   _fused_local_vol_backward_kernel (sqrt(N) checkpointing
+│   │                              #     in SRAM; masked tile access, no dynamic indexing)
+│   │                              #   LocalVolParams, select_local_vol_blocks
+│   │                              #   reference_local_vol_ee[_adjoint] (CPU-verified)
+│   │                              #   reference_checkpointed_ee_adjoint (CPU-verified)
+│   │                              #   FusedLocalVolCVAFunction, fused_local_vol_ee/_cva
 │   │       triton_cva_fusion.py   # ---------- PHASE 5 ---------- fused O(N)-memory reduction:
 │   │                              #   _fused_exposure_forward_kernel  (paths->MtM->floor->reduce,
 │   │                              #     register accumulator, bounded grid-stride; NO path matrix)
@@ -114,6 +130,16 @@ xva-cuda-engine/
 ├── manual_sandbox.py               # interactive CLI inspection harness: nudge market/credit
 │                                   # params, print CVA + AAD Greeks, write sandbox_exposures.png
 ├── benchmarks/
+│   ├── _harness.py                 # SHARED measurement primitives -- Measurement, measure(),
+│   │                               # reset_cuda, is_oom, free_vram_bytes, markdown_table.
+│   │                               # cuda.Event timing exists ONLY here; the four bench
+│   │                               # scripts each had their own copy before, which risked
+│   │                               # cross-script numbers not being comparable.
+│   ├── bench_all_phases.py         # WRAPPER: PyTorch baseline vs Phase 3/4/5 over an M sweep.
+│   │                               # Markdown report (time / peak VRAM / speedup / survival
+│   │                               # matrix) + --find-oom bisection for the exact baseline
+│   │                               # OOM threshold. NEVER RUN.
+│   ├── profile_scaling.py          # single-kernel M sweep, rows labelled ramp-up/saturated
 │   ├── bench_phase2.py             # AAD O(1) vs FD O(n) scaling sweep, ASCII table + optional CSV
 │   ├── bench_phase3.py             # fused-vs-PyTorch time + peak VRAM sweep; torch.cuda.Event
 │   │                               # timing, max_memory_allocated, OOM captured as a result
@@ -127,7 +153,10 @@ xva-cuda-engine/
     ├── test_phase2.py              # 59 tests, all passing (33 core + 26 collateral/CSA)
     ├── test_phase3.py              # 54 tests: 27 CPU-tier passing, 27 GPU-tier skipped locally
     ├── test_phase4.py              # 57 tests: 37 CPU-tier passing, 20 GPU-tier skipped locally
-    └── test_phase5.py              # 54 tests: 37 CPU-tier passing, 18 GPU-tier skipped locally
+    ├── test_phase5.py              # 54 tests: 37 CPU-tier passing, 18 GPU-tier skipped locally
+    ├── test_phase6.py              # 44 tests: surface, arbitrage penalties, non-linear adjoint
+    │                               # (CPU only -- the maths was settled before any Triton)
+    └── test_phase6_kernel.py       # 51 tests: 42 CPU-tier passing, 9 GPU-tier NEVER RUN
 ```
 
 **Full suite: 219 passed, 65 skipped** (`python -m pytest tests/ -q`, ~40s on CPU).
@@ -396,6 +425,45 @@ The `Import "src.csrc.triton_cva_fusion" could not be resolved` warning is a Pyl
 
 Replaced by `benchmarks/profile_scaling.py`, which uses a real 3-leg portfolio, imports from the right module, and marks each row's regime.
 
+### Phase 6 kernel — written, CPU-verified maths, NEVER EXECUTED
+
+`src/csrc/triton_local_vol_cva.py` + `tests/test_phase6_kernel.py` (**42 CPU tests passing, 9 GPU tests never run**).
+
+**Verified on CPU:**
+
+- **Sequential adjoint == `torch.autograd`** to `rel_tol=1e-9` across shapes (1,1), (3,4), (17,9), (64,40), (32,252). The recursion is `a_k = Xbar_k + a_{k+1} * J_k` with `J_k = 1 + (dsigma_k/dX_k)(sqrt(dt) Z_k - sigma_k dt)`.
+- **sqrt(N) checkpointing == full storage to EXACTLY `0.00e+00`** — bitwise identical, across N in {4,16,40,100,252} and BLOCK_CK in {1,2,4,8,16,64}. This is the strongest available evidence the checkpointing scheme is right: not "within tolerance", but the same floating-point values.
+- **Two traps caught by dedicated tests.** (a) `Xbar_k`, the direct state adjoint from the EE output, must be injected at *every* step, not just the terminal one — terminal-only injection gives a smooth, plausible gradient that is **63.3% wrong**. (b) The skew must be centred on `log(S0)`; an uncentred `tanh(kappa*x)` saturates at `x ~ 4.6`, driving `dsigma/dx` to ~1e-5 and silently reducing the kernel to the constant-vol Phase 5 case while appearing to exercise state dependence.
+
+**Design decisions forced by Triton, worth recording:**
+
+1. **Triton cannot index a register tile by a runtime value.** `tile[:, k]` does not exist. This blocks checkpointing twice over — storing state into slot k, and reading it back. The workaround is masked write / masked reduction, each costing `BLOCK` lane-ops. **That is the real reason sqrt(N) is the right scheme here, not merely a memory optimisation:** at N=252 it makes `BLOCK_CK=16`, so masked access costs 16 ops instead of the 256 a full-trajectory tile would need.
+2. **No branching on per-lane data.** Every step guard past the horizon is `tl.where`, never `if`, so warps do not diverge.
+3. **Parametric volatility, not a Dupire grid**: `sigma = base + skew*tanh(kappa*(x - x_ref)) + term*t`. Closed-form in both `dsigma/dx` and `dsigma/dtheta`, register-only, no gather, no memory divergence. Connecting it to the calibrated SSVI surface means fitting these parameters to `sigma_LV` — follow-on work, not done.
+
+**Expected first-contact failures on Colab** (in likelihood order): `tl.math.tanh` may not exist in the installed Triton version; the nested loops over a runtime `n_segments` may not unroll acceptably; scalar `tl.load(ptr + k)` with a runtime `k` inside the loop. The CPU/GPU tier split means any Tier 2 failure is *purely* translation — the maths and the checkpointing are settled.
+
+### FIXED: the grid-uniformity tolerance was mis-formulated
+
+Commit `d4998d2` loosened the uniform-grid check in `fused_expected_exposure` from `1e-6 * dt` to `1e-4 * dt` with no recorded reason. Investigated:
+
+**The loosening was a genuine bug fix — but `1e-4` was a patch on a mis-formulated test.**
+
+`torch.linspace` rounding is `O(eps * T)` and **independent of N**, because the time values are `O(T)`. Testing that deviation against `dt = T/N` injects a spurious factor of N, so the ratio grows linearly with N. Measured on `linspace(0, 1, N+1)`:
+
+| N | float32 dev/dt | float64 dev/dt |
+|---|---|---|
+| 252 | 1.1e-05 | 2.4e-14 |
+| 1000 | 7.3e-05 | 1.1e-13 |
+| 2520 | 9.4e-05 | 2.8e-13 |
+| 10000 | 4.3e-04 | 1.0e-12 |
+
+So `1e-6 * dt` rejects a perfectly valid float32 grid from about **N=100** — the original bound was broken, and the loosening was necessary. But `1e-4 * dt` only buys headroom to about **N=2700**; at N=2520 the margin was already down to 6%.
+
+**Fix applied:** bound the deviation against the *horizon*, not the step — `max|s_i - s_0| <= 64 * eps * T`. This is N-independent and dtype-aware. Validated across N in {2 … 50,000}, T in {0.25, 1, 10, 30}, both dtypes: every legitimate grid passes, and a real 1e-4 perturbation is still rejected by orders of magnitude.
+
+The check now lives in one place, `src/xva/exposure.py::_grid_step` (public alias `validate_uniform_grid`), used by `triton_cva_fusion.py` and `triton_local_vol_cva.py`. Previously there were **three** inline copies with three different tolerances (`1e-4`, `1e-4`, `1e-9`) — the `1e-9` one in `exposure.py` would have failed on float32 too. 60 regression tests added in `tests/test_phase2.py::TestGridUniformityTolerance`, including one that asserts *why* the formulation changed.
+
 ## Known bugs / technical blockers
 
 1. **RESOLVED 2026-08-21 — the Colab bypass worked; the GPU tier now runs and passes there.** Kept for the record. Local GPU remains unusable: `Get-PnpDevice` on the RTX 3050 Laptop GPU reports `CM_PROB_FAILED_POST_START`; `nvidia-smi` fails with a permissions error; `torch.cuda.device_count() == 0` even though PyTorch 2.4.0+cu121 is CUDA-built (`torch.backends.cuda.is_built() == True`) and `nvcuda.dll` loads fine. This is an NVIDIA driver/device fault, not a PyTorch install issue.
@@ -417,18 +485,21 @@ Replaced by `benchmarks/profile_scaling.py`, which uses a real 3-leg portfolio, 
 
 ## Next immediate task for the upcoming session
 
-**The GPU tier is verified. Next: collect the benchmark numbers, then write the Phase 6 kernel.**
+**Priority 1: collect benchmark numbers. There are still none.**
 
-1. **Push the outstanding local fix, then re-sync Colab.** `tests/test_phase4.py::test_delta_matches_closed_form` has an uncommitted fix (`float(value.detach())`) for the `UserWarning` seen on the last Colab run. Commit and push it, then `git pull` on Colab and re-run the suite; expect **285 passed, 3 skipped, 0 failed, 0 warnings**. (`tests/test_phase5.py` memory-regime tests, `tests/test_phase3.py` warning fix, and `benchmarks/profile_scaling.py` are already pushed and confirmed on Colab as of the 282-passed run.)
-1a. **Review the `d4998d2` grid-tolerance change** (`1e-6 * dt` -> `1e-4 * dt` in `fused_expected_exposure`) before trusting it long-term — see the note under the milestone above. Either confirm the fp32-`linspace` explanation and record it, or tighten it back and fix the actual root cause.
-2. **Collect the headline numbers, which still do not exist.** All three benchmark harnesses have been written but never run on a GPU:
-   - `benchmarks/profile_scaling.py` — peak VRAM and throughput vs M, labelled by regime. Start here: it is the cleanest evidence for the O(1)-in-M claim.
-   - `benchmarks/bench_phase3.py` — fused vs pure PyTorch, time and peak VRAM.
-   - `benchmarks/bench_phase4.py` — pre-allocated dW vs in-kernel Philox. On a 16 GiB T4 expect `OOM (pred)` at 20M for both designs; use `--paths 1000000 5000000 10000000`.
-   - `benchmarks/bench_phase5.py` — materialised paths vs fused. This is where the 50M-path row lives, and where Phase 4 should hit `OOM (pred)` while Phase 5 completes.
-   Record the T4 device name, driver, Triton and PyTorch versions alongside every number.
-3. **Then** write `_fused_local_vol_cva_kernel` (Phase 6). The maths is CPU-verified and the blueprint is at https://claude.ai/code/artifact/ebeb0229-c0db-43e3-be68-140a2ba8693f — but note the forward becomes a *sequential* time loop (no `tl.cumsum`) and the backward needs a sqrt(N) checkpoint buffer, so it is a structurally different kernel from Phases 3-5, not an edit of one.
-4. Optional but cheap: `tests/test_phase6.py` currently has no GPU tier at all. Once the kernel exists, mirror the Phase 5 tiering pattern.
+Every benchmark harness is written and *none* has produced a measurement on a GPU. The thesis currently has zero empirical performance data, which is the single biggest gap.
+
+1. `python benchmarks/bench_all_phases.py --find-oom --markdown results.md` — the headline table. PyTorch baseline vs Phase 3/4/5 across M in {1e5, 1e6, 5e6, 1e7, 5e7}, with time, peak VRAM, speedup, a survival matrix, and a bisected OOM threshold. The analytic model puts the baseline's OOM between **2M and 3M paths** on a 14.7 GiB T4; expect Phase 4 to OOM around 10M and Phase 5 alone to survive at 50M.
+2. `python benchmarks/profile_scaling.py` — the O(1)-memory evidence, with each row labelled ramp-up or saturated.
+3. `bench_phase3.py`, `bench_phase4.py`, `bench_phase5.py` for the per-phase detail. On a 16 GiB T4 use `--paths 1000000 5000000 10000000` for Phase 4; 20M predict-OOMs for both designs there.
+
+Record the device name, driver, Triton and PyTorch versions alongside every number.
+
+**Priority 2: run the Phase 6 kernel for the first time.**
+
+`python -m pytest tests/test_phase6_kernel.py -v` — 9 GPU tests. Expect iteration; see the expected-failure list in the Phase 6 kernel section above. Because the maths is CPU-verified, any failure is a translation bug, not a derivation bug.
+
+**Priority 3 (optional):** connect the Phase 6 parametric surface to the calibrated SSVI surface, and add a GPU tier to `tests/test_phase6.py`, which currently has none.
 
 Deferred Phase 2 nice-to-haves (not blocking Phase 3):
 
