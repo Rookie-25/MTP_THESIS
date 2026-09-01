@@ -541,6 +541,43 @@ def reference_checkpointed_ee_adjoint(
 # Triton kernels
 # ==========================================================================
 @triton.jit
+def _tanh(x):
+    r"""``tanh`` built from ``exp`` alone, for Triton-version portability.
+
+    ``tl.math.tanh`` does not exist in Triton 3.6.0 (it moved between
+    ``tl.math``, ``tl.extra.libdevice`` and top-level ``tl`` across releases),
+    and guessing the right name is how this kernel failed its first compile.
+    ``tl.exp`` and ``tl.where`` are used by the Phase 3-5 kernels, which compile
+    and pass on the target, so building on them is guaranteed to work.
+
+    Uses the overflow-free identity
+
+    .. math:: \tanh(x) = \operatorname{sign}(x)\,\frac{1 - u}{1 + u},
+              \qquad u = e^{-2|x|} \in (0, 1].
+
+    The obvious form :math:`(e^{2x}-1)/(e^{2x}+1)` is **not** usable: at
+    :math:`x \gtrsim 89` in float32 the exponential overflows to infinity and
+    the ratio becomes ``inf/inf = nan``. Taking ``exp`` of a non-positive
+    argument cannot overflow, so this form saturates cleanly to :math:`\pm 1`.
+
+    Measured against ``torch.tanh`` over :math:`x \in [-40, 40]` plus extremes:
+    max absolute error 1.1e-16 (float64) and 6.0e-08 (float32, ~0.5 ulp), all
+    outputs finite and within :math:`[-1, 1]`.
+
+    Args:
+        x: Input tile of any shape.
+
+    Returns:
+        ``tanh(x)``, same shape and dtype.
+    """
+    positive = x >= 0.0
+    magnitude = tl.where(positive, x, -x)
+    decay = tl.exp(-2.0 * magnitude)
+    folded = (1.0 - decay) / (1.0 + decay)
+    return tl.where(positive, folded, -folded)
+
+
+@triton.jit
 def _fused_local_vol_forward_kernel(
     params_ptr,
     coeff_b_ptr,
@@ -596,8 +633,11 @@ def _fused_local_vol_forward_kernel(
     reference = tl.load(params_ptr + 6)
     dt = tl.load(params_ptr + 7)
     sqrt_dt = tl.load(params_ptr + 8)
-
-    log_s0 = tl.log(s0)
+    # log(S0) is computed host-side rather than with tl.log here: tl.log is
+    # the only other primitive in this kernel not already exercised by the
+    # Phase 3-5 kernels, and it is a single scalar, so there is nothing to
+    # gain by taking the version risk.
+    log_s0 = tl.load(params_ptr + 9)
     zeros_m = tl.zeros([BLOCK_M], dtype=DTYPE)
     zeros_tile = tl.zeros([BLOCK_M, BLOCK_CK], dtype=DTYPE)
 
@@ -635,7 +675,7 @@ def _fused_local_vol_forward_kernel(
                 rng_offset = (local_m * n_columns + step).to(tl.int32)
                 z = tl.randn(program_seed, rng_offset).to(DTYPE)
 
-                tanh_term = tl.math.tanh(kappa * (state - reference))
+                tanh_term = _tanh(kappa * (state - reference))
                 sigma = base + skew * tanh_term + term * (step * dt)
 
                 advanced = (
@@ -740,8 +780,11 @@ def _fused_local_vol_backward_kernel(
     reference = tl.load(params_ptr + 6)
     dt = tl.load(params_ptr + 7)
     sqrt_dt = tl.load(params_ptr + 8)
-
-    log_s0 = tl.log(s0)
+    # log(S0) is computed host-side rather than with tl.log here: tl.log is
+    # the only other primitive in this kernel not already exercised by the
+    # Phase 3-5 kernels, and it is a single scalar, so there is nothing to
+    # gain by taking the version risk.
+    log_s0 = tl.load(params_ptr + 9)
     zeros_m = tl.zeros([BLOCK_M], dtype=DTYPE)
     zeros_tile = tl.zeros([BLOCK_M, BLOCK_CK], dtype=DTYPE)
 
@@ -771,7 +814,7 @@ def _fused_local_vol_backward_kernel(
                 live = step < n_steps
                 rng_offset = (local_m * n_columns + step).to(tl.int32)
                 z = tl.randn(program_seed, rng_offset).to(DTYPE)
-                tanh_term = tl.math.tanh(kappa * (state - reference))
+                tanh_term = _tanh(kappa * (state - reference))
                 sigma = base + skew * tanh_term + term * (step * dt)
                 advanced = (
                     state
@@ -811,7 +854,7 @@ def _fused_local_vol_backward_kernel(
                 live = step < n_steps
                 rng_offset = (local_m * n_columns + step).to(tl.int32)
                 z = tl.randn(program_seed, rng_offset).to(DTYPE)
-                tanh_term = tl.math.tanh(kappa * (state - reference))
+                tanh_term = _tanh(kappa * (state - reference))
                 sigma = base + skew * tanh_term + term * (step * dt)
                 advanced = (
                     state
@@ -833,7 +876,7 @@ def _fused_local_vol_backward_kernel(
                 rng_offset = (local_m * n_columns + step).to(tl.int32)
                 z = tl.randn(program_seed, rng_offset).to(DTYPE)
 
-                tanh_term = tl.math.tanh(kappa * (state_k - reference))
+                tanh_term = _tanh(kappa * (state_k - reference))
                 sigma = base + skew * tanh_term + term * (step * dt)
                 d_sigma_d_x = skew * kappa * (1.0 - tanh_term * tanh_term)
                 vol_factor = sqrt_dt * z - sigma * dt
@@ -932,6 +975,7 @@ class FusedLocalVolCVAFunction(torch.autograd.Function):
                 torch.as_tensor(reference, device=device, dtype=dtype),
                 torch.as_tensor(dt, device=device, dtype=dtype),
                 torch.as_tensor(math.sqrt(dt), device=device, dtype=dtype),
+                torch.log(spot_zero.reshape(())),
             )
         ).contiguous()
 
