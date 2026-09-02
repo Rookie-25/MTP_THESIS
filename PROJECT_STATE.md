@@ -138,15 +138,21 @@ xva-cuda-engine/
 │   ├── bench_all_phases.py         # WRAPPER: PyTorch baseline vs Phase 3/4/5 over an M sweep.
 │   │                               # Markdown report (time / peak VRAM / speedup / survival
 │   │                               # matrix) + --find-oom bisection for the exact baseline
-│   │                               # OOM threshold. NEVER RUN.
+│   │                               # OOM threshold. RUN on a T4 -- numbers below.
 │   ├── profile_scaling.py          # single-kernel M sweep, rows labelled ramp-up/saturated
 │   ├── bench_phase2.py             # AAD O(1) vs FD O(n) scaling sweep, ASCII table + optional CSV
 │   ├── bench_phase3.py             # fused-vs-PyTorch time + peak VRAM sweep; torch.cuda.Event
 │   │                               # timing, max_memory_allocated, OOM captured as a result
 │   ├── bench_phase5.py             # Phase 4 (materialised paths) vs Phase 5 (fused);
 │   │                               # M to 50M, pre-flight VRAM guard, O(N) memory evidence
-│   └── bench_phase4.py             # Phase 3 (dW in HBM) vs Phase 4 (in-kernel Philox);
-│                                   # M up to 20M, reports the OOM crossover + ceiling analysis
+│   ├── bench_phase4.py             # Phase 3 (dW in HBM) vs Phase 4 (in-kernel Philox);
+│   │                               # M up to 20M, reports the OOM crossover + ceiling analysis
+│   └── bench_phase6.py             # Phase 6 Triton local-vol AAD vs PyTorch autograd.
+│                                   # Forward time, backward time (CUDA events around
+│                                   # .backward() ALONE), and peak VRAM -- each stage
+│                                   # guarded SEPARATELY so a row can show a completed
+│                                   # forward beside an OOM backward. Includes a
+│                                   # cross-backend agreement check. NEVER RUN.
 └── tests/
     ├── conftest.py                 # repo-root sys.path fallback, seeds torch, `device` fixture (cpu/cuda param)
     ├── test_phase1.py              # 15 tests, all passing
@@ -443,6 +449,62 @@ Replaced by `benchmarks/profile_scaling.py`, which uses a real 3-leg portfolio, 
 
 **Expected first-contact failures on Colab** (in likelihood order): `tl.math.tanh` may not exist in the installed Triton version; the nested loops over a runtime `n_segments` may not unroll acceptably; scalar `tl.load(ptr + k)` with a runtime `k` inside the loop. The CPU/GPU tier split means any Tier 2 failure is *purely* translation — the maths and the checkpointing are settled.
 
+### Phase 6 benchmark — written, NEVER RUN
+
+`benchmarks/bench_phase6.py`. Compares the Phase 6 Triton kernel against a
+PyTorch autograd baseline (`reference_local_vol_ee`, a sequential Python time
+loop) on forward time, backward time and peak VRAM, sweeping M in {1e4, 1e5,
+1e6, 5e6} at N=252.
+
+**The request asked for gradients w.r.t. SSVI surface parameters. That is not
+what this measures, because it does not exist.** The kernel evaluates the
+parametric tanh surface and differentiates `S0`, `mu`, `base`, `skew`. The SSVI
+surface in `src/models/vol_surface.py` is a separate object with separate
+parameters (`rho`, `eta`, `gamma`, and the ATM variance term structure) and
+**there is no code path from those to the kernel**. Benchmarking "SSVI
+gradients" would mean timing something unimplemented. The benchmark measures
+the honest comparison instead — identical surface, identical estimator, on both
+backends — and says so prominently in its own report.
+
+Design points worth keeping:
+
+- **Forward and backward are guarded and recorded independently.** A single
+  guard sized on forward+backward would blank the forward column at exactly
+  the path counts where the finding lives. The interesting row is
+  "baseline forward completes, baseline backward cannot be attempted" — the
+  forward is not the problem, the `O(M*N)` tape is.
+- **The backward is timed with CUDA events around `.backward()` alone**, with
+  the forward completed and synchronised first. Reporting `total - forward`
+  would fold the forward's tape-construction cost into the backward number,
+  which is the very quantity under study.
+- **The two backends draw independent random streams** (Philox in-kernel vs
+  `torch.randn`), so they agree only to Monte-Carlo error. An agreement check
+  runs both forwards at the smallest M and reports the deviation against the
+  `1/sqrt(M)` scale, rather than assuming the comparison is like-for-like.
+- **Strike 95, not 100** — at `strike == spot` the t=0 exposure is exactly zero,
+  on the `max(V,0)` kink. No reason to time a degenerate point.
+
+Analytic predictions on a 14.6 GiB T4, N=252, fp32 (from `predict_peak_bytes`;
+the baseline tape term is deliberately under-estimated so the guard errs toward
+attempting a run):
+
+| M | baseline fwd | baseline fwd+bwd | kernel fwd+bwd |
+|---|---|---|---|
+| 10,000 | 38.6 MiB | 115.5 MiB | 0.3 MiB |
+| 100,000 | 385.7 MiB | 1.13 GiB | 3.1 MiB |
+| 1,000,000 | 3.77 GiB | 11.28 GiB | 4.0 MiB |
+| 5,000,000 | 18.83 GiB | 56.38 GiB | 4.0 MiB |
+
+So expect the baseline's backward to die around M=1M while its forward still
+runs, and both its stages to be gone at 5M — with the kernel flat at 4 MiB
+throughout, bounded by `--max-programs`, not by M.
+
+Verified on CPU (the kernel itself still needs a GPU): module imports, CLI
+parses, every reporting branch renders from fabricated results, and the
+baseline wiring produces finite non-zero gradients for all four parameters
+(`spot 2.36e+00`, `drift 1.38e+02`, `base 9.54e+01`, `skew -3.92e+00` at
+M=4000, N=32, float64, with `EE[0]=4.85` safely off the kink).
+
 ### FIXED: the grid-uniformity tolerance was mis-formulated
 
 Commit `d4998d2` loosened the uniform-grid check in `fused_expected_exposure` from `1e-6 * dt` to `1e-4 * dt` with no recorded reason. Investigated:
@@ -485,9 +547,22 @@ The check now lives in one place, `src/xva/exposure.py::_grid_step` (public alia
 
 ## Next immediate task for the upcoming session
 
-**Priority 1: collect benchmark numbers. There are still none.**
+**Priority 1: finish collecting benchmark numbers.**
 
-Every benchmark harness is written and *none* has produced a measurement on a GPU. The thesis currently has zero empirical performance data, which is the single biggest gap.
+`bench_all_phases.py` HAS now run on a Colab Tesla T4 (torch 2.11.0+cu128, CUDA
+12.8, Triton 3.6.0, Python 3.13.15). Measured, not predicted:
+
+- **Phase 5 is 8.16x faster than the PyTorch baseline at 1M paths.**
+- **Phase 5 peak VRAM is flat at 4.3 MiB from 1M through 50M paths** — the
+  O(1)-in-M claim, demonstrated over a 50x range.
+- **The PyTorch baseline's OOM boundary bisects to 2,750,000 paths** (it fails
+  at 2,781,250). The analytic model had predicted "between 2M and 3M" — a
+  genuine prediction, confirmed.
+- At M=5M: baseline and Phase 3 OOM; Phase 4 survives at 14.15 GiB; Phase 5 at
+  4.3 MiB. At M=50M **only Phase 5 survives** (821 ms, 4.3 MiB).
+
+Still outstanding: `profile_scaling.py`, the per-phase detail runs, and
+`bench_phase6.py` (never executed).
 
 1. `python benchmarks/bench_all_phases.py --find-oom --markdown results.md` — the headline table. PyTorch baseline vs Phase 3/4/5 across M in {1e5, 1e6, 5e6, 1e7, 5e7}, with time, peak VRAM, speedup, a survival matrix, and a bisected OOM threshold. The analytic model puts the baseline's OOM between **2M and 3M paths** on a 14.7 GiB T4; expect Phase 4 to OOM around 10M and Phase 5 alone to survive at 50M.
 2. `python benchmarks/profile_scaling.py` — the O(1)-memory evidence, with each row labelled ramp-up or saturated.
@@ -495,9 +570,31 @@ Every benchmark harness is written and *none* has produced a measurement on a GP
 
 Record the device name, driver, Triton and PyTorch versions alongside every number.
 
-**Priority 2: run the Phase 6 kernel for the first time.**
+**Priority 2: re-run the Phase 6 kernel tests after the ATM-kink fix.**
 
-`python -m pytest tests/test_phase6_kernel.py -v` — 9 GPU tests. Expect iteration; see the expected-failure list in the Phase 6 kernel section above. Because the maths is CPU-verified, any failure is a translation bug, not a derivation bug.
+`python -m pytest tests/test_phase6_kernel.py -v`. Two GPU-tier defects have
+been found and fixed since the kernel was written:
+
+1. `tl.math.tanh` does not exist in Triton 3.6.0 — replaced with an exp-only
+   device function; `tl.log` moved host-side. Both were the only primitives in
+   the kernel not already proven by Phases 3-5.
+2. The gradient test sampled `strike == spot`, putting `V[0]` exactly on the
+   `max(V,0)` kink where no derivative exists, so AAD (subgradient 0) and
+   central FD (half the jump) disagreed by a fixed absolute amount. The kernel
+   was never wrong. Test moved to `strike=95`; `TestAtTheMoneyKink` now pins
+   the behaviour down.
+
+**Priority 3: run `benchmarks/bench_phase6.py`.** Start with
+`--paths 10000 100000` to confirm the agreement check is clean before spending
+time on the large sizes.
+
+**Priority 4 (open design gap): connect SSVI to the kernel.** Nothing currently
+links the calibrated `SSVISurface` to the local-vol kernel. Closing it means
+either fitting `(base, skew, kappa)` to the Dupire `sigma_LV` implied by a
+calibrated surface, or replacing the tanh with a Chebyshev expansion in
+`(t, log S)` whose coefficients depend differentiably on `rho`, `eta`, `gamma`.
+Until then, no result in this project is a gradient with respect to an SSVI
+parameter, and none should be described as one.
 
 **Priority 3 (optional):** connect the Phase 6 parametric surface to the calibrated SSVI surface, and add a GPU tier to `tests/test_phase6.py`, which currently has none.
 
