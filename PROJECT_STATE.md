@@ -729,6 +729,143 @@ Measured on the default single-swap netting set (20,000 paths, 5Y, threshold 5,
 MTA 1, MPOR 10bd): the CSA removes **83% of aggregate EE and 88% of peak PFE**,
 with `EE_collat <= EE_uncollat` pointwise as Phase 2 asserts.
 
+### Figures — GENERATED from real Colab measurements (bench_all_phases.py ran)
+
+`results.md` now holds the actual `bench_all_phases.py` output measured on a
+Tesla T4 (torch 2.11.0+cu128, CUDA 12.8, Triton 3.6.0) — saved verbatim from
+that run rather than regenerated, since inventing a "reproduction" would defeat
+the point. `benchmarks/plot_results.py` ran against it and `figures/` now holds
+all three deliverables in PNG (300 DPI) + PDF, plus `figure_data.csv`.
+
+**Bug found and fixed while running it for the first time:**
+`BACKEND_STYLE` was keyed on placeholder names (`"Phase 3 Triton"`) invented
+before any real report existed. The actual `bench_all_phases.py` headers carry
+a parenthetical detail (`"Phase 3 (Triton + dW)"`), so the exact-match lookup
+missed on every non-baseline backend and all three silently fell back to one
+generic grey style with the same marker — invisible in code review, obvious
+the instant the figure was rendered. Fixed by matching on the stable `"Phase
+N"` prefix (`BACKEND_STYLE_BY_PREFIX` + `backend_style()`), which survives the
+parenthetical wording changing again.
+
+**Two more defects found by rendering and looking, not by reading code:**
+the "device capacity" annotation collided with per-series end labels at
+upper-right (moved to upper-left, which is reliably empty since every series
+starts small); and two end labels (PyTorch baseline vs Phase 3 at M=1e6: 4.71
+vs 3.78 GiB) sat close enough in log-space to overlap text. Fixed with
+`_place_end_labels` — a collision-avoidance pass using the real
+`transData`-to-points mapping, run *after* `set_xscale`/`set_ylim` are
+finalised (a before-limits pass gives the wrong pixel positions). A residual
+case — Phase 4's own label sitting almost exactly on the capacity dash
+(14.15 vs 14.6 GiB, a data coincidence no repositioning avoids) — is handled
+with a white halo (`bbox`) behind the text rather than movement.
+
+**Measured headline numbers, now on the actual figures:** Phase 5 is 7.97x
+faster than the PyTorch baseline at 1M paths and its peak VRAM is flat at
+4.0–4.3 MiB from 100K through 50M paths (a 500x span) while every other
+backend is OOM by 5–10M. The baseline's OOM boundary bisects to 2,750,000
+paths. The exposure figure (computed live, no GPU needed) shows the CSA
+removing 83% of aggregate EE and 88% of peak PFE on the default single-swap
+netting set.
+
+### plot_results.py CUDA fix
+
+`compute_exposure_curves` called `.numpy()` on tensors from a `GBMSimulator`
+that defaults to CUDA when available, so the exposure-figure tests failed with
+`TypeError: can't convert cuda:0 device type tensor to numpy` the first time
+they ran on a GPU instance rather than this CPU-only dev machine (515/515 had
+passed locally, masking it entirely). Fixed at the root: the simulator is now
+pinned to `device=torch.device("cpu")` explicitly, since this figure
+illustrates a model property and must render identically with or without a
+GPU present. `.cpu()` was also added before every `.numpy()` call as
+defense-in-depth, in case a future change reintroduces a CUDA tensor upstream.
+
+### Chebyshev local-vol kernel — fixes the tanh kernel's wing saturation
+
+`src/models/vol_surface.py` (`chebyshev_basis`, `chebyshev_basis_derivative`,
+`evaluate_chebyshev_local_vol`, `LocalVolFit` extended with `basis=`,
+`fit_local_vol_params(..., basis="chebyshev", degree=K)`) +
+`src/csrc/triton_chebyshev_local_vol_cva.py` (NEW) +
+`tests/test_chebyshev_local_vol.py` (**42 CPU tests passing, 2 GPU tests
+NEVER RUN**).
+
+**The problem, quantified.** The tanh bridge's own diagnostics showed it:
+against an SSVI surface (`rho=-0.35, eta=1.2, gamma=0.45`) at a 3-sigma
+sampling width, relative RMSE was 15.99% and R^2 only 0.578 — tanh is bounded
+by construction and cannot follow a Dupire surface that keeps rising into the
+wing.
+
+**The fix and its measured effect.** Replacing the spatial term with a
+degree-K Chebyshev expansion removes the saturation ceiling entirely.
+Verified on the identical surface, identical sampling width:
+
+| degree K | relative RMSE | R^2 |
+|---|---|---|
+| tanh (baseline) | 15.99% | 0.578 |
+| 4 | 9.42% | 0.854 |
+| 8 | **7.71%** | **0.902** |
+| 12 | 7.14% | 0.916 |
+| 16 | 6.90% | 0.922 |
+| 24 | 6.73% | 0.925 |
+
+Error decreases monotonically with degree (asserted directly in
+`TestWingSaturationFix::test_error_decreases_monotonically_with_degree` — a
+least-squares fit's optimum at degree K is a superset of degree K-1's, so this
+must hold exactly, and a violation would mean the solver is buggy, not that
+the model is a bad fit).
+
+**Solved in closed form, not by gradient descent — a real correction made
+during verification.** The Chebyshev sum is *linear* in its coefficients, so
+it has a unique global optimum reachable by one weighted least-squares solve.
+An earlier version used Adam (matching the tanh fit's pattern for
+consistency); verification caught it under-converging against the real SSVI
+target — R^2 plateaued at 0.916 at degree 12 after 1500 iterations, with the
+fitted range overshooting the target range at both ends, the signature of an
+under-converged fit rather than a representational limit. Recognising the
+model is linear and solving it exactly removed the failure mode rather than
+papering over it with more iterations: identifiability against a target
+constructed *as* a Chebyshev sum now recovers all coefficients to **1.9e-16**
+(machine precision), and the fit is ~1000x faster (0.004s vs ~1-2s).
+
+**A finding recorded but not chased:** letting each coefficient vary linearly
+in time (`c_k(t) = a_k + b_k*t`, still linear in all parameters, still one LS
+solve) measured R^2=0.951 at degree 8 vs 0.902 for the flat-term model — a
+real further improvement. Not implemented: it doubles the kernel's per-step
+parameter-gradient bookkeeping for a second, unverified change, and the
+flat-term result already closes most of the gap. Noted here as the next
+concrete step if degree-8 Chebyshev alone is not enough.
+
+**Kernel status — CPU-verified, GPU tier NEVER RUN**, following this
+project's established two-tier pattern for every Triton kernel it has
+written:
+
+- Forward, full-storage adjoint, and sqrt(N)-checkpointed adjoint are all
+  plain-torch / hand-derived-Python, matching the tanh kernel's own reference
+  structure exactly.
+- **Full-storage adjoint vs `torch.autograd`: exact to float64 machine
+  epsilon** (2.22e-16) on every one of `(s0, drift, term, c_0..c_4)`.
+- **Checkpointed adjoint vs full-storage adjoint: `torch.equal` — exactly
+  0.0 — across checkpoint strides {4, 8, 16, 40}.**
+- The Triton device-function logic (`_chebyshev_eval_and_deriv`, evaluating
+  the Chebyshev sum and its derivative via the standard T_k/U_k recurrences)
+  was translated to a line-for-line Python mirror and checked against the
+  verified `chebyshev_basis`/`chebyshev_basis_derivative` — bit-identical
+  across degrees 0-14 — *before* being trusted inside the untestable `.jit`
+  kernel.
+- **No Triton install or CUDA device was available while writing the kernel
+  file**, so `_fused_chebyshev_local_vol_forward_kernel` /
+  `_..._backward_kernel` have never been compiled. They mirror
+  `triton_local_vol_cva.py`'s two kernels primitive-for-primitive (same
+  `tl.where`/`tl.exp`/`tl.randn`/`tl.load`/`tl.maximum`/`tl.sum`, same
+  sqrt(N)-checkpointing structure), so the risk is concentrated in one
+  genuinely new pattern flagged explicitly in the module docstring: a Python
+  list of per-coefficient gradient accumulators built over a
+  `range(DEGREE + 1)` loop where `DEGREE` is a `tl.constexpr`. That is the
+  first thing to inspect on a Colab compile failure.
+- 2 GPU-tier tests (`TestChebyshevKernelGPU`, `@requires_triton`-gated,
+  matching every prior phase's convention) are written and will run the
+  moment Triton is available; they compare the compiled kernel against the
+  CPU reference and against finite differences.
+
 ### Phase 6 benchmark — written, NEVER RUN
 
 `benchmarks/bench_phase6.py`. Compares the Phase 6 Triton kernel against a

@@ -84,16 +84,40 @@ INK_MUTED = "#8a8983"
 GRID = "#e4e3df"
 SURFACE = "#ffffff"
 
-#: Backend hue order. Colour follows the entity, so these are keyed by name and
-#: stay fixed across every figure; a backend missing from one run must not
-#: repaint the others.
-BACKEND_STYLE: Dict[str, Tuple[str, str, str]] = {
-    "PyTorch baseline": ("#2a78d6", "-", "o"),
-    "Phase 3 Triton": ("#eb6834", "--", "s"),
-    "Phase 4 Philox": ("#1baf7a", "-.", "^"),
-    "Phase 5 fused": ("#4a3aa7", ":", "D"),
-}
+#: Backend hue order, keyed by a substring of the column header rather than
+#: the full string. bench_all_phases.py's headers carry a parenthetical detail
+#: that has already changed once between when this file was written and the
+#: first real report it parsed ("Phase 3 Triton" vs the actual
+#: "Phase 3 (Triton + dW)") -- an exact-match dict silently fell back to one
+#: generic grey style for every non-baseline backend, which is invisible in
+#: code review and obvious the moment the figure is rendered. Matching on the
+#: stable "Phase N" prefix survives the parenthetical wording changing again.
+#: Colour follows the entity, so order is fixed across every figure; a
+#: backend missing from one run must not repaint the others.
+BACKEND_STYLE_BY_PREFIX: Tuple[Tuple[str, Tuple[str, str, str]], ...] = (
+    ("PyTorch baseline", ("#2a78d6", "-", "o")),
+    ("Phase 3", ("#eb6834", "--", "s")),
+    ("Phase 4", ("#1baf7a", "-.", "^")),
+    ("Phase 5", ("#4a3aa7", ":", "D")),
+)
 FALLBACK_STYLE = (INK_SECONDARY, "-", "v")
+
+
+def backend_style(name: str) -> Tuple[str, str, str]:
+    """Resolve a column header to ``(colour, linestyle, marker)``.
+
+    Args:
+        name: The backend name as it appears in the benchmark report.
+
+    Returns:
+        Its assigned style, matched by prefix; :data:`FALLBACK_STYLE` if no
+        prefix matches (which then renders visibly grey rather than silently
+        colliding with another series -- see the naming-drift note above).
+    """
+    for prefix, style in BACKEND_STYLE_BY_PREFIX:
+        if name.startswith(prefix):
+            return style
+    return FALLBACK_STYLE
 
 EE_COLOR = "#2a78d6"
 PFE_COLOR = "#eb6834"
@@ -108,7 +132,14 @@ MARKER_RING = 1.5  # surface ring, so overlapping markers stay separable
 X_HEADROOM = 3.5
 
 
-def _end_label(axes, x, y, name: str, colour: str, oom: bool) -> None:
+#: Minimum vertical gap between two end-of-line labels, in points. Below
+#: this, an 8-9pt label collides with its neighbour -- exactly what the first
+#: render of this figure showed for two series ending within a log-decade's
+#: worth of closeness (PyTorch baseline vs Phase 3 at M=1e6: 4.71 vs 3.78 GiB).
+MIN_LABEL_GAP_POINTS = 13.0
+
+
+def _end_label(axes, x, y, name: str, colour: str, oom: bool, y_offset: float = 0.0) -> None:
     """Label a series at its right-hand end, noting an OOM on a second line.
 
     One text object per series end: an OOM drawn as a separate offset
@@ -121,16 +152,67 @@ def _end_label(axes, x, y, name: str, colour: str, oom: bool) -> None:
         name: Series name.
         colour: Series colour, used only for the OOM word.
         oom: Whether the series ran out of memory beyond this point.
+        y_offset: Extra vertical offset in points, from
+            :func:`_place_end_labels`'s collision avoidance. Zero when no
+            nearby label needed separating.
     """
+    # A white halo behind the text: a series whose value sits close to a
+    # reference line (the device-capacity dash, or another series) would
+    # otherwise have that line's stroke visibly cut through the letters --
+    # exactly what Phase 4's label does at 14.15 GiB against a 14.6 GiB
+    # capacity line, a data coincidence no repositioning avoids.
+    halo = dict(facecolor=SURFACE, edgecolor="none", pad=1.5)
     axes.annotate(
-        name, xy=(x, y), xytext=(8, 0), textcoords="offset points",
-        va="center", ha="left", fontsize=8, color=INK_SECONDARY, zorder=4,
+        name, xy=(x, y), xytext=(8, y_offset), textcoords="offset points",
+        va="center", ha="left", fontsize=8, color=INK_SECONDARY, zorder=5,
+        bbox=halo,
     )
     if oom:
         axes.annotate(
-            "OOM beyond", xy=(x, y), xytext=(8, -9),
+            "OOM beyond", xy=(x, y), xytext=(8, y_offset - 9),
             textcoords="offset points", va="center", ha="left", fontsize=7,
-            color=colour, fontweight="bold", zorder=4,
+            color=colour, fontweight="bold", zorder=5, bbox=halo,
+        )
+
+
+def _place_end_labels(figure, axes, entries: Sequence[dict]) -> None:
+    """Place every series' end label, pushing apart any that would collide.
+
+    Must be called **after** the axes scale and limits are finalised: it
+    converts each label's data-space anchor to points via ``transData``,
+    which only gives the right answer once ``set_xscale``/``set_ylim`` etc.
+    have already run.
+
+    The algorithm is a single top-down sweep: process labels from the
+    highest data value down, and whenever the next one would land within
+    :data:`MIN_LABEL_GAP_POINTS` of the last *placed* position (not its own
+    raw anchor), push it down by exactly enough to clear that gap. With at
+    most a handful of series this greedy pass is sufficient; it does not need
+    to be optimal, only collision-free.
+
+    Args:
+        figure: The containing figure, for the pixel-to-points DPI ratio.
+        axes: Target axes.
+        entries: One dict per series, with keys ``x``, ``y``, ``name``,
+            ``colour``, ``oom``.
+    """
+    if not entries:
+        return
+    points_per_pixel = 72.0 / figure.dpi
+
+    def anchor_points_y(entry: dict) -> float:
+        _, pixel_y = axes.transData.transform((entry["x"], entry["y"]))
+        return pixel_y * points_per_pixel
+
+    last_placed: Optional[float] = None
+    for entry in sorted(entries, key=lambda e: e["y"], reverse=True):
+        points_y = anchor_points_y(entry)
+        if last_placed is not None and last_placed - points_y < MIN_LABEL_GAP_POINTS:
+            points_y = last_placed - MIN_LABEL_GAP_POINTS
+        last_placed = points_y
+        _end_label(
+            axes, entry["x"], entry["y"], entry["name"], entry["colour"],
+            entry["oom"], y_offset=points_y - anchor_points_y(entry),
         )
 
 
@@ -279,10 +361,16 @@ class BenchmarkResults:
 
     @property
     def backends(self) -> List[str]:
-        """Backend names, ordered by the palette where possible."""
+        """Backend names, ordered by the palette prefix where possible."""
         seen = list(self.times_ms) or list(self.peak_bytes)
-        known = [name for name in BACKEND_STYLE if name in seen]
-        return known + [name for name in seen if name not in BACKEND_STYLE]
+
+        def rank(name: str) -> int:
+            for index, (prefix, _style) in enumerate(BACKEND_STYLE_BY_PREFIX):
+                if name.startswith(prefix):
+                    return index
+            return len(BACKEND_STYLE_BY_PREFIX)
+
+        return sorted(seen, key=rank)
 
     @property
     def has_timings(self) -> bool:
@@ -390,11 +478,12 @@ def plot_execution_time(
     axes.grid(True, which="major", axis="both")
     axes.grid(True, which="minor", axis="both", alpha=0.4)
 
+    label_entries = []
     for name in results.backends:
         series = results.times_ms.get(name) or {}
         if not series:
             continue
-        colour, style, marker = BACKEND_STYLE.get(name, FALLBACK_STYLE)
+        colour, style, marker = backend_style(name)
         paths = sorted(series)
         values = [series[m] for m in paths]
         axes.plot(
@@ -405,10 +494,10 @@ def plot_execution_time(
         )
         # Direct label at the line end: the documented relief for the
         # low-contrast slot, and it survives greyscale printing.
-        _end_label(
-            axes, paths[-1], values[-1], name, colour,
-            any(oom > paths[-1] for oom in results.oom_paths.get(name, [])),
-        )
+        label_entries.append(dict(
+            x=paths[-1], y=values[-1], name=name, colour=colour,
+            oom=any(oom > paths[-1] for oom in results.oom_paths.get(name, [])),
+        ))
 
     axes.set_xscale("log")
     axes.set_yscale("log")
@@ -418,6 +507,9 @@ def plot_execution_time(
     axes.set_title("Execution time scaling", color=INK_PRIMARY, loc="left")
     _legend_below(axes)
     _caption(figure, results, "A line stops where that backend ran out of memory.")
+    # Placed last, once xscale/yscale/xlim are all final -- collision
+    # avoidance needs the real data-to-pixel mapping to measure gaps.
+    _place_end_labels(figure, axes, label_entries)
 
     figure.tight_layout()
     figure.savefig(output, dpi=dpi, bbox_inches="tight")
@@ -453,11 +545,12 @@ def plot_peak_vram(
     axes.grid(True, which="major", axis="both")
     axes.grid(True, which="minor", axis="both", alpha=0.4)
 
+    label_entries = []
     for name in results.backends:
         series = results.peak_bytes.get(name) or {}
         if not series:
             continue
-        colour, style, marker = BACKEND_STYLE.get(name, FALLBACK_STYLE)
+        colour, style, marker = backend_style(name)
         paths = sorted(series)
         values = [series[m] / BYTES_PER_MIB for m in paths]
         axes.plot(
@@ -466,15 +559,20 @@ def plot_peak_vram(
             markeredgecolor=SURFACE, markeredgewidth=MARKER_RING,
             label=name, zorder=3,
         )
-        _end_label(axes, paths[-1], values[-1], name, colour, False)
+        label_entries.append(dict(
+            x=paths[-1], y=values[-1], name=name, colour=colour, oom=False,
+        ))
 
     axes.set_xscale("log")
     axes.set_yscale("log")
     _reserve_label_room(axes, results)
 
     if results.total_vram_bytes:
-        # Right-aligned at the end of its own line, clear of both the series
-        # labels and the legend -- at upper-left it sat underneath both.
+        # Top-left, not top-right: a series ending near capacity (the
+        # interesting case -- that is exactly the OOM boundary) puts its own
+        # end label at the right edge, where a right-aligned capacity label
+        # used to collide with it directly. The top-left corner is reliably
+        # empty, since every series starts small at the smallest M.
         capacity = results.total_vram_bytes / BYTES_PER_MIB
         axes.axhline(
             capacity, color=INK_MUTED, linestyle=(0, (6, 3)), linewidth=1.2,
@@ -482,9 +580,10 @@ def plot_peak_vram(
         )
         axes.annotate(
             f"device capacity {capacity / 1024.0:,.1f} GiB",
-            xy=(0.99, capacity), xycoords=("axes fraction", "data"),
-            xytext=(0, 6), textcoords="offset points", ha="right",
-            fontsize=8, color=INK_SECONDARY, zorder=4,
+            xy=(0.02, capacity), xycoords=("axes fraction", "data"),
+            xytext=(0, 6), textcoords="offset points", ha="left",
+            fontsize=8, color=INK_SECONDARY, zorder=5,
+            bbox=dict(facecolor=SURFACE, edgecolor="none", pad=1.5),
         )
 
     axes.set_xlabel("Monte-Carlo paths $M$")
@@ -495,6 +594,7 @@ def plot_peak_vram(
         figure, results,
         "A flat line is memory independent of $M$; a sloped line is $O(M)$.",
     )
+    _place_end_labels(figure, axes, label_entries)
 
     figure.tight_layout()
     figure.savefig(output, dpi=dpi, bbox_inches="tight")
@@ -616,7 +716,15 @@ def compute_exposure_curves(
     )
 
     torch.manual_seed(seed)
-    simulator = GBMSimulator(maturity=maturity, n_steps=n_steps, dtype=torch.float64)
+    # Pinned to CPU explicitly: GBMSimulator defaults to CUDA when available,
+    # and this figure illustrates a model property rather than hardware, so it
+    # must produce the same figure whether or not a GPU is present. Without
+    # this, running the test suite on a GPU instance sends every tensor below
+    # to cuda:0 and .numpy() at the bottom raises.
+    simulator = GBMSimulator(
+        maturity=maturity, n_steps=n_steps, dtype=torch.float64,
+        device=torch.device("cpu"),
+    )
     times = simulator.time_grid()
 
     with torch.no_grad():
@@ -638,12 +746,16 @@ def compute_exposure_curves(
             mtm, times, terms, confidence_level=confidence_level
         )
 
+    # .cpu() before .numpy() even though the simulator above is pinned to CPU:
+    # cheap when already local, and it means this line cannot regress again if
+    # a future change (e.g. a CSATerms default, or a device-inferring helper)
+    # reintroduces a CUDA tensor upstream.
     return ExposureCurves(
-        times=times.numpy(),
-        ee=uncollateralized.ee.numpy(),
-        pfe=uncollateralized.pfe.numpy(),
-        ee_collateralized=collateralized.ee.numpy(),
-        pfe_collateralized=collateralized.pfe.numpy(),
+        times=times.cpu().numpy(),
+        ee=uncollateralized.ee.cpu().numpy(),
+        pfe=uncollateralized.pfe.cpu().numpy(),
+        ee_collateralized=collateralized.ee.cpu().numpy(),
+        pfe_collateralized=collateralized.pfe.cpu().numpy(),
         confidence_level=confidence_level,
         n_paths=n_paths,
         threshold=threshold,

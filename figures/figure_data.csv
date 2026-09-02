@@ -1,4 +1,36 @@
 figure,series,x,y,unit
+execution_time,PyTorch baseline,100000,10.500000,ms
+execution_time,PyTorch baseline,1000000,137.400000,ms
+peak_vram,PyTorch baseline,100000,505623347,bytes
+peak_vram,PyTorch baseline,1000000,5057323991,bytes
+execution_time,PyTorch baseline,5000000,,OOM
+execution_time,PyTorch baseline,10000000,,OOM
+execution_time,PyTorch baseline,50000000,,OOM
+execution_time,Phase 3 (Triton + dW),100000,8.200000,ms
+execution_time,Phase 3 (Triton + dW),1000000,76.800000,ms
+peak_vram,Phase 3 (Triton + dW),100000,405169766,bytes
+peak_vram,Phase 3 (Triton + dW),1000000,4058744094,bytes
+execution_time,Phase 3 (Triton + dW),5000000,,OOM
+execution_time,Phase 3 (Triton + dW),10000000,,OOM
+execution_time,Phase 3 (Triton + dW),50000000,,OOM
+execution_time,Phase 4 (in-kernel Philox),100000,9.800000,ms
+execution_time,Phase 4 (in-kernel Philox),1000000,82.600000,ms
+execution_time,Phase 4 (in-kernel Philox),5000000,408.700000,ms
+peak_vram,Phase 4 (in-kernel Philox),100000,304401612,bytes
+peak_vram,Phase 4 (in-kernel Philox),1000000,3049426780,bytes
+peak_vram,Phase 4 (in-kernel Philox),5000000,15193446809,bytes
+execution_time,Phase 4 (in-kernel Philox),10000000,,OOM
+execution_time,Phase 4 (in-kernel Philox),50000000,,OOM
+execution_time,Phase 5 (fused reduction),100000,4.000000,ms
+execution_time,Phase 5 (fused reduction),1000000,17.200000,ms
+execution_time,Phase 5 (fused reduction),5000000,87.100000,ms
+execution_time,Phase 5 (fused reduction),10000000,171.900000,ms
+execution_time,Phase 5 (fused reduction),50000000,864.600000,ms
+peak_vram,Phase 5 (fused reduction),100000,3145728,bytes
+peak_vram,Phase 5 (fused reduction),1000000,4508876,bytes
+peak_vram,Phase 5 (fused reduction),5000000,4508876,bytes
+peak_vram,Phase 5 (fused reduction),10000000,4508876,bytes
+peak_vram,Phase 5 (fused reduction),50000000,4508876,bytes
 exposure,ee_uncollateralized,0.000000,0.00000000,exposure
 exposure,ee_uncollateralized,0.052083,2.02064174,exposure
 exposure,ee_uncollateralized,0.104167,2.92496288,exposure

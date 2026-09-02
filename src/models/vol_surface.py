@@ -129,6 +129,9 @@ __all__ = [
     "fit_local_vol_params",
     "evaluate_parametric_local_vol",
     "DEFAULT_FIT_SIGMA_WIDTH",
+    "chebyshev_basis",
+    "chebyshev_basis_derivative",
+    "evaluate_chebyshev_local_vol",
 ]
 
 
@@ -935,6 +938,124 @@ def calibrate_surface(
 DEFAULT_FIT_SIGMA_WIDTH = 3.0
 
 
+def chebyshev_basis(u: Tensor, degree: int) -> Tensor:
+    r"""Stack :math:`T_0(u), \dots, T_{\text{degree}}(u)` along a new leading axis.
+
+    Uses the three-term recurrence
+    :math:`T_k(u) = 2u\,T_{k-1}(u) - T_{k-2}(u)`, :math:`T_0 = 1`,
+    :math:`T_1 = u` -- pure ``torch`` arithmetic, so it is differentiable
+    end-to-end and needs no special-function library.
+
+    Args:
+        u: Standardised coordinate, any shape, nominally in :math:`[-1, 1]`
+            (the recurrence is well-defined outside that range too, but the
+            polynomials grow quickly there, so extrapolation should be used
+            deliberately, not by accident).
+        degree: Highest polynomial order, :math:`\ge 0`.
+
+    Returns:
+        Shape ``(degree + 1, *u.shape)``.
+
+    Raises:
+        ValueError: If ``degree`` is negative.
+    """
+    if degree < 0:
+        raise ValueError(f"degree must be non-negative, got {degree}")
+    terms = [torch.ones_like(u)]
+    if degree >= 1:
+        terms.append(u)
+    previous, current = terms[0], u if degree >= 1 else None
+    for _ in range(2, degree + 1):
+        nxt = 2.0 * u * current - previous
+        terms.append(nxt)
+        previous, current = current, nxt
+    return torch.stack(terms, dim=0)
+
+
+def chebyshev_basis_derivative(u: Tensor, degree: int) -> Tensor:
+    r"""Stack :math:`T_0{}'(u), \dots, T_{\text{degree}}{}'(u)`.
+
+    Uses :math:`T_k{}'(u) = k\,U_{k-1}(u)` for :math:`k \ge 1` and
+    :math:`T_0{}' = 0`, where :math:`U` is the Chebyshev polynomial of the
+    second kind, itself built from :math:`U_0 = 1`, :math:`U_1 = 2u`,
+    :math:`U_k = 2u\,U_{k-1} - U_{k-2}`.
+
+    This closed form exists specifically for the hand-written Triton adjoint,
+    which cannot call ``torch.autograd``. It is checked against
+    ``torch.autograd`` of :func:`chebyshev_basis` directly in
+    ``tests/test_chebyshev_local_vol.py`` -- the CPU forward path uses
+    autograd and never calls this function, so that comparison is a genuine
+    independent check, not a tautology.
+
+    Args:
+        u: Standardised coordinate, any shape.
+        degree: Highest polynomial order, :math:`\ge 0`.
+
+    Returns:
+        Shape ``(degree + 1, *u.shape)``.
+
+    Raises:
+        ValueError: If ``degree`` is negative.
+    """
+    if degree < 0:
+        raise ValueError(f"degree must be non-negative, got {degree}")
+    derivatives = [torch.zeros_like(u)]
+    if degree >= 1:
+        u_prev = torch.ones_like(u)  # U_0
+        derivatives.append(1.0 * u_prev)  # T_1' = 1 * U_0
+    if degree >= 2:
+        u_curr = 2.0 * u  # U_1
+        derivatives.append(2.0 * u_curr)  # T_2' = 2 * U_1
+        for k in range(3, degree + 1):
+            u_next = 2.0 * u * u_curr - u_prev
+            derivatives.append(float(k) * u_next)
+            u_prev, u_curr = u_curr, u_next
+    return torch.stack(derivatives, dim=0)
+
+
+def evaluate_chebyshev_local_vol(
+    coefficients: Tensor,
+    half_width: float,
+    reference: float,
+    term: float,
+    time: Tensor,
+    log_spot: Tensor,
+    *,
+    floor: float = 1e-4,
+) -> Tensor:
+    r"""Evaluate the fitted Chebyshev surface, matching the kernel's arithmetic.
+
+    .. math::
+        \sigma(t, x) = \max\!\Bigl(\sum_{k=0}^{K} c_k\, T_k(u) ,\ \text{floor}\Bigr)
+                       + \sigma_{\text{term}}\, t,
+        \qquad u = \frac{x - x_{\text{ref}}}{w}
+
+    The floor applies to the spatial (Chebyshev) term only, before the linear
+    time correction is added -- so it guards the part of the surface that can
+    actually go non-positive (an unconstrained polynomial has no sign
+    guarantee), the same honest-regularisation pattern as
+    :attr:`LocalVolatilitySurface.variance_floor`.
+
+    Args:
+        coefficients: :math:`c_0, \dots, c_K`, shape ``(K + 1,)``.
+        half_width: :math:`w`, the domain half-width used to standardise
+            ``log_spot``.
+        reference: :math:`x_{\text{ref}}`.
+        term: Linear time slope.
+        time: :math:`t`, any shape.
+        log_spot: :math:`x = \log S`, broadcastable with ``time``.
+        floor: Lower clamp on the spatial term.
+
+    Returns:
+        :math:`\sigma(t, x)`, broadcast shape.
+    """
+    degree = coefficients.numel() - 1
+    u = (log_spot - reference) / half_width
+    basis = chebyshev_basis(u, degree)
+    spatial = torch.tensordot(coefficients, basis, dims=([0], [0]))
+    return torch.clamp(spatial, min=floor) + term * time
+
+
 @dataclass(frozen=True)
 class LocalVolFit:
     r"""A parametric local-vol surface fitted to a Dupire :math:`\sigma_{LV}`.
@@ -977,6 +1098,16 @@ class LocalVolFit:
             already regularisation, so the fit error understates true model
             error.
         density_weighted: Whether the lognormal transition density was used.
+        basis: ``"tanh"`` (default) or ``"chebyshev"``. Determines which of
+            ``base``/``skew``/``kappa`` versus ``chebyshev_coefficients``/
+            ``chebyshev_half_width`` are meaningful; ``term`` and
+            ``reference`` are used by both bases.
+        chebyshev_coefficients: :math:`c_0, \dots, c_K` when
+            ``basis == "chebyshev"``, else ``None``.
+        chebyshev_half_width: The domain half-width :math:`w` used to
+            standardise log-spot into the Chebyshev argument, when
+            ``basis == "chebyshev"``, else ``None``. Fixed, not fitted -- see
+            :func:`fit_local_vol_params`.
     """
 
     base: float
@@ -993,25 +1124,49 @@ class LocalVolFit:
     fitted_range: Tuple[float, float]
     variance_floor_fraction: float
     density_weighted: bool
+    basis: str = "tanh"
+    chebyshev_coefficients: Optional[Tuple[float, ...]] = None
+    chebyshev_half_width: Optional[float] = None
 
     def to_local_vol_params(self) -> "object":
-        """Convert to the kernel's ``LocalVolParams``.
+        """Convert to the matching kernel-side parameter object.
 
         Imported lazily so ``src.models`` carries no hard dependency on
         ``src.csrc`` -- the models layer must stay importable on a machine with
         no Triton, which is where most of this project was developed.
 
         Returns:
-            A :class:`src.csrc.triton_local_vol_cva.LocalVolParams`.
-        """
-        from src.csrc.triton_local_vol_cva import LocalVolParams
+            A :class:`src.csrc.triton_local_vol_cva.LocalVolParams` when
+            ``basis == "tanh"``, or a
+            :class:`src.csrc.triton_chebyshev_local_vol_cva.ChebyshevLocalVolParams`
+            when ``basis == "chebyshev"``.
 
-        return LocalVolParams(
-            base=self.base,
-            skew=self.skew,
-            kappa=self.kappa,
-            term=self.term,
-            reference=self.reference,
+        Raises:
+            ValueError: On an unrecognised ``basis``.
+        """
+        if self.basis == "chebyshev":
+            from src.csrc.triton_chebyshev_local_vol_cva import (
+                ChebyshevLocalVolParams,
+            )
+
+            return ChebyshevLocalVolParams(
+                coefficients=self.chebyshev_coefficients,
+                half_width=self.chebyshev_half_width,
+                reference=self.reference,
+                term=self.term,
+            )
+        if self.basis == "tanh":
+            from src.csrc.triton_local_vol_cva import LocalVolParams
+
+            return LocalVolParams(
+                base=self.base,
+                skew=self.skew,
+                kappa=self.kappa,
+                term=self.term,
+                reference=self.reference,
+            )
+        raise ValueError(
+            f"unknown basis {self.basis!r}; expected 'tanh' or 'chebyshev'"
         )
 
     @property
@@ -1028,12 +1183,27 @@ class LocalVolFit:
     def summary(self) -> str:
         """A human-readable report of the fit and its quality."""
         verdict = "OK" if self.is_well_fitted else "POOR -- see note below"
+        if self.basis == "chebyshev":
+            degree = len(self.chebyshev_coefficients) - 1
+            terms = " + ".join(
+                f"{c:+.5f}*T_{k}(u)" for k, c in enumerate(self.chebyshev_coefficients)
+            )
+            formula = (
+                f"sigma(t,x) = max({terms}, floor) "
+                f"{'+' if self.term >= 0 else '-'} {abs(self.term):.6f}*t   "
+                f"[u = (x - {self.reference:.6f}) / {self.chebyshev_half_width:.6f}, "
+                f"degree {degree}]"
+            )
+        else:
+            formula = (
+                f"sigma(t,x) = {self.base:.6f} "
+                f"{'+' if self.skew >= 0 else '-'} {abs(self.skew):.6f}"
+                f"*tanh({self.kappa:.6f}*(x - {self.reference:.6f})) "
+                f"{'+' if self.term >= 0 else '-'} {abs(self.term):.6f}*t"
+            )
         lines = [
-            "SSVI -> Phase 6 local-vol parameter fit",
-            f"  sigma(t,x) = {self.base:.6f} "
-            f"{'+' if self.skew >= 0 else '-'} {abs(self.skew):.6f}"
-            f"*tanh({self.kappa:.6f}*(x - {self.reference:.6f})) "
-            f"{'+' if self.term >= 0 else '-'} {abs(self.term):.6f}*t",
+            f"SSVI -> Phase 6 local-vol parameter fit ({self.basis})",
+            f"  {formula}",
             "",
             f"  samples            : {self.n_samples:,}"
             f"{' (density-weighted)' if self.density_weighted else ''}",
@@ -1125,75 +1295,28 @@ def local_vol_sampling_grid(
     return time.expand(n_time, n_space), log_spot
 
 
-def fit_local_vol_params(
+def _sample_dupire_target(
     local_vol: LocalVolatilitySurface,
     spot_zero: float,
     maturity: float,
     *,
-    drift: float = 0.0,
-    n_time: int = 24,
-    n_space: int = 41,
-    reference_vol: float = 0.2,
-    sigma_width: float = DEFAULT_FIT_SIGMA_WIDTH,
-    density_weighted: bool = True,
-    iterations: int = 600,
-    learning_rate: float = 5e-2,
-) -> LocalVolFit:
-    r"""Project a Dupire :math:`\sigma_{LV}` onto the Phase 6 kernel's form.
+    drift: float,
+    n_time: int,
+    n_space: int,
+    reference_vol: float,
+    sigma_width: float,
+    density_weighted: bool,
+):
+    r"""Sample the Dupire target and its calibration weights.
 
-    This is the missing link between the calibrated SSVI surface and the
-    Phase 6 Triton kernel. The kernel does not read an ``SSVISurface``: it
-    evaluates a four-parameter ``tanh`` surface in registers, because a gather
-    from a Dupire grid would serialise every warp. SSVI therefore has to be
-    *projected* onto that family, and the projection error is a real modelling
-    cost that :class:`LocalVolFit` reports rather than hides.
-
-    Fitting is a weighted least squares in volatility units:
-
-    .. math::
-        \min_{\sigma_0, \sigma_{\text{skew}}, \kappa, \sigma_{\text{term}}}
-        \sum_i \omega_i \bigl(\hat\sigma(t_i, x_i)
-        - \sigma_{LV}(t_i, x_i)\bigr)^2
-
-    with :math:`\omega_i` the lognormal transition density when
-    ``density_weighted``. The weighting matters more than it appears: an
-    unweighted fit treats a state three sigma out at :math:`t = 0.1` as equally
-    important as the money, and the result is visibly wrong exactly where the
-    exposure is.
-
-    :math:`\sigma_0` and :math:`\kappa` are fitted through ``softplus`` so they
-    stay strictly positive, which the kernel's ``LocalVolParams`` validates.
-    An unconstrained optimiser happily reaches a negative :math:`\kappa` -- an
-    observationally equivalent surface with flipped skew -- which then fails
-    validation downstream for no obvious reason.
-
-    :math:`x_{\text{ref}}` is **not** fitted; it is pinned to
-    :math:`\log S_0`. See :attr:`LocalVolFit.reference`.
-
-    Args:
-        local_vol: The Dupire surface built on a calibrated SSVI surface.
-        spot_zero: :math:`S_0`.
-        maturity: Longest maturity the kernel will simulate to.
-        drift: :math:`\mu`, used for the density weights only.
-        n_time: Time nodes in the sampling grid.
-        n_space: Log-spot nodes per slice.
-        reference_vol: Volatility scale for the sampling cone and the weights.
-        sigma_width: Grid half-width in standard deviations.
-        density_weighted: Weight by the lognormal transition density.
-        iterations: Adam steps.
-        learning_rate: Adam learning rate.
+    Shared by every basis: the grid, the target evaluation, and the density
+    weighting are basis-independent, so this exists once rather than being
+    copied per fitting routine (a second copy is exactly how the two bases
+    would silently drift apart on the sampling convention).
 
     Returns:
-        A :class:`LocalVolFit` holding the parameters and the fit diagnostics.
-
-    Raises:
-        ValueError: On invalid grid or optimiser settings.
+        ``(time, log_spot, reference, target, weights, floor_fraction)``.
     """
-    if iterations < 1:
-        raise ValueError(f"iterations must be positive, got {iterations}")
-    if learning_rate <= 0.0:
-        raise ValueError(f"learning_rate must be positive, got {learning_rate}")
-
     time, log_spot = local_vol_sampling_grid(
         spot_zero,
         maturity,
@@ -1234,6 +1357,57 @@ def fit_local_vol_params(
         weights = torch.ones_like(target)
     weights = weights / weights.sum()
 
+    return time, log_spot, reference, target, weights, floor_fraction
+
+
+def _fit_diagnostics(
+    weights: Tensor,
+    target: Tensor,
+    fitted: Tensor,
+) -> Tuple[float, float, float, float]:
+    """Shared error metrics: ``(rmse, relative_rmse, r_squared, max_abs)``."""
+    residual = fitted - target
+    rmse = float(torch.sqrt((weights * residual**2).sum()))
+    mean_target = float((weights * target).sum())
+    total_variance = float((weights * (target - mean_target) ** 2).sum())
+    r_squared = 1.0 - (rmse**2) / total_variance if total_variance > 0.0 else 1.0
+    relative_rmse = rmse / mean_target if mean_target > 0.0 else float("inf")
+    return rmse, relative_rmse, r_squared, float(residual.abs().max())
+
+
+def _fit_tanh_local_vol(
+    local_vol: LocalVolatilitySurface,
+    spot_zero: float,
+    maturity: float,
+    *,
+    drift: float,
+    n_time: int,
+    n_space: int,
+    reference_vol: float,
+    sigma_width: float,
+    density_weighted: bool,
+    iterations: int,
+    learning_rate: float,
+) -> LocalVolFit:
+    r"""The original four-parameter tanh fit -- copied verbatim as a helper.
+
+    :math:`\sigma_0` and :math:`\kappa` are fitted through ``softplus`` so
+    they stay strictly positive, which the kernel's ``LocalVolParams``
+    validates. An unconstrained optimiser happily reaches a negative
+    :math:`\kappa` -- an observationally equivalent surface with flipped skew
+    -- which then fails validation downstream for no obvious reason.
+
+    :math:`x_{\text{ref}}` is **not** fitted; it is pinned to
+    :math:`\log S_0`. See :attr:`LocalVolFit.reference`.
+    """
+    time, log_spot, reference, target, weights, floor_fraction = (
+        _sample_dupire_target(
+            local_vol, spot_zero, maturity, drift=drift, n_time=n_time,
+            n_space=n_space, reference_vol=reference_vol,
+            sigma_width=sigma_width, density_weighted=density_weighted,
+        )
+    )
+
     # softplus-parameterised, so base > 0 and kappa > 0 by construction.
     raw_base = torch.tensor(
         math.log(math.expm1(max(float(target.mean()), 1e-3))),
@@ -1268,25 +1442,19 @@ def fit_local_vol_params(
 
     with torch.no_grad():
         fitted = model()
-        residual = fitted - target
-        rmse = float(torch.sqrt((weights * residual**2).sum()))
-        mean_target = float((weights * target).sum())
-        total_variance = float((weights * (target - mean_target) ** 2).sum())
-        r_squared = (
-            1.0 - (rmse**2) / total_variance if total_variance > 0.0 else 1.0
+        rmse, relative_rmse, r_squared, max_abs_error = _fit_diagnostics(
+            weights, target, fitted
         )
-
         return LocalVolFit(
+            basis="tanh",
             base=float(torch.nn.functional.softplus(raw_base)),
             skew=float(skew),
             kappa=float(torch.nn.functional.softplus(raw_kappa)),
             term=float(term),
             reference=reference,
             rmse=rmse,
-            max_abs_error=float(residual.abs().max()),
-            relative_rmse=(
-                rmse / mean_target if mean_target > 0.0 else float("inf")
-            ),
+            max_abs_error=max_abs_error,
+            relative_rmse=relative_rmse,
             r_squared=r_squared,
             n_samples=int(target.numel()),
             target_range=(float(target.min()), float(target.max())),
@@ -1294,6 +1462,229 @@ def fit_local_vol_params(
             variance_floor_fraction=floor_fraction,
             density_weighted=density_weighted,
         )
+
+
+def _fit_chebyshev_local_vol(
+    local_vol: LocalVolatilitySurface,
+    spot_zero: float,
+    maturity: float,
+    *,
+    drift: float,
+    n_time: int,
+    n_space: int,
+    reference_vol: float,
+    sigma_width: float,
+    density_weighted: bool,
+    iterations: int,
+    learning_rate: float,
+    degree: int,
+    floor: float,
+) -> LocalVolFit:
+    r"""Fit a degree-``degree`` Chebyshev expansion in place of the tanh form.
+
+    Fixes the wing-saturation failure mode of the tanh fit: tanh is bounded
+    by construction, so past a few multiples of :math:`1/\kappa` it is flat
+    and cannot track a Dupire surface that keeps rising into the wing. A
+    Chebyshev polynomial has no such ceiling -- degree :math:`K` can represent
+    any curvature the sampled points show, at the cost of :math:`K + 1`
+    coefficients instead of two.
+
+    **Solved in closed form, not by gradient descent.**
+    :math:`\sigma = \sum_k c_k T_k(u) + \sigma_{\text{term}} t` is *linear*
+    in :math:`(c_0, \dots, c_K, \sigma_{\text{term}})`, so the weighted
+    least-squares problem has a unique global optimum reachable by one solve --
+    no learning rate, no iteration count, no convergence question. An earlier
+    version of this function used Adam, matching the tanh fit's pattern for
+    consistency; verification caught it under-converging on a real SSVI target
+    (:math:`R^2` plateaued at 0.916 at degree 12 with 1500 iterations, and the
+    fitted range overshot the target range at both ends -- the signature of an
+    under-converged fit, not a representational limit). Recognising the model
+    is linear and solving it exactly removes that failure mode entirely rather
+    than papering over it with more iterations. ``iterations`` and
+    ``learning_rate`` are accepted for signature symmetry with the tanh path
+    and ignored here.
+
+    The domain half-width is **fixed** to ``sigma_width * reference_vol``, the
+    same quantity that defines the sampling cone, rather than fitted. Letting
+    it float would let the fit narrow the domain to match noise near the money
+    instead of the region the kernel actually simulates over -- the same
+    reasoning that keeps ``reference`` pinned in the tanh fit.
+
+    The floor is applied to the raw polynomial sum only, after the unconstrained
+    solve, before the linear time term is added -- see
+    :func:`evaluate_chebyshev_local_vol`. It is therefore an approximation
+    exactly to the extent the floor actually binds; :attr:`LocalVolFit`'s
+    diagnostics report how often the *target's* own floor bound, and a fitted
+    range far from the target range is the signal to check the analogous
+    question for the fit itself.
+    """
+    if degree < 0:
+        raise ValueError(f"degree must be non-negative, got {degree}")
+    if floor <= 0.0:
+        raise ValueError(f"floor must be positive, got {floor}")
+    del iterations, learning_rate  # unused: closed-form, see docstring
+
+    time, log_spot, reference, target, weights, floor_fraction = (
+        _sample_dupire_target(
+            local_vol, spot_zero, maturity, drift=drift, n_time=n_time,
+            n_space=n_space, reference_vol=reference_vol,
+            sigma_width=sigma_width, density_weighted=density_weighted,
+        )
+    )
+
+    half_width = sigma_width * reference_vol
+    u = (log_spot - reference) / half_width
+    basis = chebyshev_basis(u, degree)  # (K+1, n_time, n_space)
+
+    n_samples = target.numel()
+    flat_basis = basis.reshape(degree + 1, n_samples).T  # (n_samples, K+1)
+    flat_time = time.reshape(n_samples, 1)
+    design = torch.cat([flat_basis, flat_time], dim=1)  # (n_samples, K+2)
+    flat_target = target.reshape(n_samples, 1)
+
+    # Fold the weights in by scaling rows with sqrt(w): least squares on the
+    # scaled system minimises sum w_i * residual_i^2, the same objective the
+    # tanh fit's Adam loop minimises.
+    sqrt_weights = torch.sqrt(weights.reshape(n_samples, 1))
+    solution = torch.linalg.lstsq(
+        design * sqrt_weights, flat_target * sqrt_weights
+    ).solution.reshape(-1)
+    coefficients, term = solution[:-1], solution[-1]
+
+    fitted = (
+        torch.clamp(torch.tensordot(coefficients, basis, dims=([0], [0])), min=floor)
+        + term * time
+    )
+    rmse, relative_rmse, r_squared, max_abs_error = _fit_diagnostics(
+        weights, target, fitted
+    )
+    return LocalVolFit(
+        basis="chebyshev",
+        base=None,
+        skew=None,
+        kappa=None,
+        term=float(term),
+        reference=reference,
+        chebyshev_coefficients=tuple(float(c) for c in coefficients),
+        chebyshev_half_width=half_width,
+        rmse=rmse,
+        max_abs_error=max_abs_error,
+        relative_rmse=relative_rmse,
+        r_squared=r_squared,
+        n_samples=n_samples,
+        target_range=(float(target.min()), float(target.max())),
+        fitted_range=(float(fitted.min()), float(fitted.max())),
+        variance_floor_fraction=floor_fraction,
+        density_weighted=density_weighted,
+    )
+
+
+def fit_local_vol_params(
+    local_vol: LocalVolatilitySurface,
+    spot_zero: float,
+    maturity: float,
+    *,
+    drift: float = 0.0,
+    n_time: int = 24,
+    n_space: int = 41,
+    reference_vol: float = 0.2,
+    sigma_width: float = DEFAULT_FIT_SIGMA_WIDTH,
+    density_weighted: bool = True,
+    iterations: int = 600,
+    learning_rate: float = 5e-2,
+    basis: str = "tanh",
+    degree: int = 8,
+    floor: float = 1e-4,
+) -> LocalVolFit:
+    r"""Project a Dupire :math:`\sigma_{LV}` onto a Phase 6 kernel's form.
+
+    This is the missing link between the calibrated SSVI surface and a Phase 6
+    Triton kernel. Neither kernel reads an ``SSVISurface`` directly: each
+    evaluates a closed-form surface in registers, because a gather from a
+    Dupire grid would serialise every warp. SSVI therefore has to be
+    *projected* onto one of these families, and the projection error is a real
+    modelling cost that :class:`LocalVolFit` reports rather than hides.
+
+    Two bases, selected by ``basis``:
+
+    ``"tanh"`` (default, unchanged from the original bridge)
+        :math:`\sigma_0 + \sigma_{\text{skew}}\tanh(\kappa(x - x_{\text{ref}}))
+        + \sigma_{\text{term}} t`. Two free spatial parameters. Bounded by
+        construction, so it **saturates** on a steep wing: fitted against an
+        SSVI surface with :math:`\rho=-0.35, \eta=1.2, \gamma=0.45` at a
+        :math:`3\sigma` sampling width, relative RMSE is 15.99% and
+        :math:`R^2` only 0.578 -- the tanh simply cannot rise as fast as the
+        target does in the wing.
+    ``"chebyshev"``
+        :math:`\max\bigl(\sum_{k=0}^{K} c_k T_k(u), \text{floor}\bigr)
+        + \sigma_{\text{term}} t`, :math:`u = (x - x_{\text{ref}})/w`.
+        :math:`K + 1` free spatial coefficients instead of two, with no
+        saturation ceiling -- more terms track more curvature. Recommended
+        whenever ``sigma_width`` is large enough for the tanh fit's own
+        diagnostics to report ``relative_rmse`` above a percent or two.
+
+    In both cases the fit is a weighted least squares in volatility units,
+    with :math:`\omega_i` the lognormal transition density when
+    ``density_weighted`` -- unweighted fitting treats a state three sigma out
+    at :math:`t=0.1` as equally important as the money, and the result is
+    visibly wrong exactly where the exposure is.
+
+    :math:`x_{\text{ref}}` is **not** fitted in either basis; it is pinned to
+    :math:`\log S_0` (see :attr:`LocalVolFit.reference`), and the Chebyshev
+    domain half-width is likewise pinned to ``sigma_width * reference_vol``
+    rather than fitted, for the same reason: letting either float lets the
+    optimiser narrow the domain or the centring to fit noise instead of
+    matching the region actually simulated.
+
+    Args:
+        local_vol: The Dupire surface built on a calibrated SSVI surface.
+        spot_zero: :math:`S_0`.
+        maturity: Longest maturity the kernel will simulate to.
+        drift: :math:`\mu`, used for the density weights only.
+        n_time: Time nodes in the sampling grid.
+        n_space: Log-spot nodes per slice.
+        reference_vol: Volatility scale for the sampling cone and the weights.
+        sigma_width: Grid half-width in standard deviations.
+        density_weighted: Weight by the lognormal transition density.
+        iterations: Adam steps. Used only for ``basis="tanh"``; the
+            Chebyshev fit is linear in its coefficients and is solved in
+            closed form by weighted least squares, so this is ignored there.
+        learning_rate: Adam learning rate. Also ignored for ``"chebyshev"``,
+            for the same reason.
+        basis: ``"tanh"`` or ``"chebyshev"``.
+        degree: Chebyshev polynomial degree :math:`K`. Ignored for ``"tanh"``.
+        floor: Positive lower clamp on the Chebyshev spatial term. Ignored for
+            ``"tanh"`` (which is positivity-constrained via ``softplus``
+            instead).
+
+    Returns:
+        A :class:`LocalVolFit` holding the parameters and the fit diagnostics.
+
+    Raises:
+        ValueError: On invalid grid or optimiser settings, an unknown
+            ``basis``, a negative ``degree``, or a non-positive ``floor``.
+    """
+    if iterations < 1:
+        raise ValueError(f"iterations must be positive, got {iterations}")
+    if learning_rate <= 0.0:
+        raise ValueError(f"learning_rate must be positive, got {learning_rate}")
+
+    if basis == "tanh":
+        return _fit_tanh_local_vol(
+            local_vol, spot_zero, maturity, drift=drift, n_time=n_time,
+            n_space=n_space, reference_vol=reference_vol,
+            sigma_width=sigma_width, density_weighted=density_weighted,
+            iterations=iterations, learning_rate=learning_rate,
+        )
+    if basis == "chebyshev":
+        return _fit_chebyshev_local_vol(
+            local_vol, spot_zero, maturity, drift=drift, n_time=n_time,
+            n_space=n_space, reference_vol=reference_vol,
+            sigma_width=sigma_width, density_weighted=density_weighted,
+            iterations=iterations, learning_rate=learning_rate,
+            degree=degree, floor=floor,
+        )
+    raise ValueError(f"unknown basis {basis!r}; expected 'tanh' or 'chebyshev'")
 
 
 def evaluate_parametric_local_vol(
