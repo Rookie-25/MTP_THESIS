@@ -21,6 +21,12 @@ testpaths = ["tests"]
 # PyTorch builds). Promote it to a failure so it cannot accumulate unnoticed --
 # older builds that stay silent are covered by the STRICT_TENSOR_SCALAR hook in
 # tests/conftest.py instead.
+markers = [
+    # Live Yahoo/FRED requests. Skipped unless XVA_NETWORK_TESTS=1, because
+    # they are neither deterministic nor available offline -- they exercise the
+    # I/O wiring only, never numerical correctness.
+    "network: hits live market data endpoints (opt-in)",
+]
 filterwarnings = [
     "error:Converting a tensor with requires_grad=True to a scalar:UserWarning",
 ]

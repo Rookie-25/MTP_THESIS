@@ -153,6 +153,13 @@ xva-cuda-engine/
 │                                   # guarded SEPARATELY so a row can show a completed
 │                                   # forward beside an OOM backward. Includes a
 │                                   # cross-backend agreement check. NEVER RUN.
+├── market_data/                    # NEW: market data + credit curve bootstrapping
+│   ├── __init__.py                 # re-exports the public surface
+│   └── fetcher.py                  # YieldCurve (linear-in-zero-rate, flat extrap),
+│                                   # CreditCurve (piecewise-constant hazard),
+│                                   # bootstrap_hazard_rates (Brent per pillar),
+│                                   # clean_option_chain (forward moneyness),
+│                                   # fetch_* wrappers (yfinance / FRED, lazy import)
 └── tests/
     ├── conftest.py                 # repo-root sys.path fallback, seeds torch, `device` fixture (cpu/cuda param)
     ├── test_phase1.py              # 15 tests, all passing
@@ -163,6 +170,7 @@ xva-cuda-engine/
     ├── test_phase6.py              # 44 tests: surface, arbitrage penalties, non-linear adjoint
     │                               # (CPU only -- the maths was settled before any Triton)
     └── test_phase6_kernel.py       # 51 tests: 42 CPU-tier passing, 9 GPU-tier NEVER RUN
+    └── test_market_data.py         # 130 tests: 124 passing, 6 network-tier opt-in
 ```
 
 **Full suite: 219 passed, 65 skipped** (`python -m pytest tests/ -q`, ~40s on CPU).
@@ -448,6 +456,107 @@ Replaced by `benchmarks/profile_scaling.py`, which uses a real 3-leg portfolio, 
 3. **Parametric volatility, not a Dupire grid**: `sigma = base + skew*tanh(kappa*(x - x_ref)) + term*t`. Closed-form in both `dsigma/dx` and `dsigma/dtheta`, register-only, no gather, no memory divergence. Connecting it to the calibrated SSVI surface means fitting these parameters to `sigma_LV` — follow-on work, not done.
 
 **Expected first-contact failures on Colab** (in likelihood order): `tl.math.tanh` may not exist in the installed Triton version; the nested loops over a runtime `n_segments` may not unroll acceptably; scalar `tl.load(ptr + k)` with a runtime `k` inside the loop. The CPU/GPU tier split means any Tier 2 failure is *purely* translation — the maths and the checkpointing are settled.
+
+### Market data layer — NEW, CPU-VERIFIED (124 tests passing)
+
+`market_data/fetcher.py` + `market_data/__init__.py` + `tests/test_market_data.py`
+(**124 passing, 6 network-tier skipped by default**).
+
+Layered so the mathematics is testable with no network and no optional
+libraries: `yfinance` and `pandas_datareader` are imported *lazily*, inside the
+functions that use them. The pure layer (`YieldCurve`, `CreditCurve`,
+`bootstrap_hazard_rates`, `clean_option_chain`, `black_vega`) imports and runs
+in CI regardless. Network tests are marked `network` and skipped unless
+`XVA_NETWORK_TESTS=1` — a live-data fixture can never be deterministic.
+
+**CDS hazard bootstrapping (the substantive content).** Piecewise-constant
+hazard `h_j` on `(T_{j-1}, T_j]` recovered from par spreads at 1Y/3Y/5Y/10Y by
+sequential one-dimensional root finds (Brent). Premium leg includes
+accrual-on-default at the interval midpoint; protection leg places default at
+the midpoint too. The objective is strictly increasing in `h_j`, so the root is
+unique and bracketing is safe.
+
+Verified numerically:
+
+- **Round trip: every input quote reprices to ≤ 1.4e-11 bp.** This is the
+  equation the bootstrap claims to solve; everything else is a consequence.
+- **Credit triangle recovered in its exact limit.** With zero rates and a flat
+  spread curve, `h = S/(1-R)` to 9.0e-08 relative at 25bp.
+- **The residual is second order, as derived.** The discrete legs use the
+  trapezoid rule, error `O((h·dt)^2)`. Measured convergence ratio on schedule
+  refinement: **4.01, 4.00, 4.00** — so the tests assert the *rate*, not a
+  tuned threshold. At 2000bp the deviation is 5.79e-04 against a predicted
+  `(h·dt)^2/12 = 5.8e-04`, matching to two digits.
+- **Exact agreement with `src/xva/cva.py` on the flat overlap** —
+  `YieldCurve.flat(r).to_tensor` vs `cva.discount_factors`, and
+  `CreditCurve.flat(h).to_tensor` vs `cva.survival_probability`, both to
+  **exactly 0.0** (`torch.equal`), as does the `Q(t_{i-1}) - Q(t_i)` marginal
+  convention.
+- **`black_vega` matches numerical differentiation of the Black-76 price to
+  1e-10** across four strike/maturity/vol combinations.
+
+**Two counter-intuitive findings recorded as tests:**
+
+1. **Monotone spreads do NOT imply a monotone forward hazard.** A 200/180/170/165
+   bp inverted-but-*flattening* curve bootstraps to hazards
+   `[0.0332, 0.0281, 0.0254, 0.0263]` — the far forward hazard ticks *up*. The
+   par spread is a survival- and discount-weighted average of the forward
+   hazard with weights decaying in `t`, so matching the 10Y average requires
+   this. The curve still reprices to 1.4e-11 bp with `Q` strictly decreasing,
+   which is what actually has to hold.
+   (`test_flattening_inversion_can_lift_the_far_forward_hazard`)
+2. **A steeply inverted curve can require a negative forward hazard**, i.e.
+   survival *increasing* — arbitrageable, and almost always a stale quote.
+   Rejected by default with a message naming the pillar and what the curve
+   already implies at zero forward hazard; `allow_negative_forward_hazard=True`
+   overrides.
+
+**FRED cannot supply a SOFR term curve.** FRED publishes overnight `SOFR` plus
+30/90/180-day backward averages, so the SOFR family reaches only ~0.5Y — there
+is no term SOFR swap (OIS) curve on FRED. `fetch_discount_curve` therefore
+defaults to splicing the SOFR short end onto Treasury CMT (`DGS1`..`DGS30`),
+and the returned `YieldCurve.label` records both approximations: Treasury is
+not SOFR (the basis is tens of bp and time-varying), and CMT par yields are
+treated as zero rates without a par bootstrap. Both are second order for CVA
+but they are approximations, not the real curve.
+
+**Option chain cleaning.** Moneyness is measured against the **forward**
+`F = S·exp((r-q)T)`, not the spot: spot moneyness displaces every expiry's
+smile by `(r-q)T`, which an SSVI fit absorbs as a spurious maturity-dependent
+skew and biases `rho`. Filters drop yfinance's `impliedVolatility == 0.0`
+solver failures, one-sided/crossed markets, spreads wider than 50% of mid,
+strikes with neither volume nor open interest, and the deep wings beyond 35%
+log-moneyness. Output feeds `calibrate_surface` directly (verified end to end).
+
+**Two real bugs found and fixed during testing:**
+
+1. `black_vega` broadcast `(forward, strike)` and `(maturity, volatility)` in
+   *separate* `np.broadcast_arrays` calls, so a scalar maturity stayed
+   0-dimensional while the mask was 1-D — `IndexError` on any mixed
+   scalar/array call, which is the common case. Now broadcasts all four in one
+   call.
+2. `allow_negative_forward_hazard=True` was **inert**: the bracket expanded
+   only upward, so when the required hazard was more negative than the initial
+   `-guess` the root was never bracketed and the function raised the very error
+   the flag exists to suppress. Now expands in whichever direction the sign at
+   each end indicates.
+
+**OPEN GAP — the bootstrapped curve cannot yet reach the CVA engine.**
+`src/xva/cva.py::_integrate_credit_leg` takes `hazard_rate` as a **scalar** and
+builds the flat-intensity curve internally via
+`marginal_default_probability(grid, hazard_rate)`. There is no parameter for an
+externally supplied survival curve, so a piecewise-constant `Q(t)` has nowhere
+to go. `CreditCurve` deliberately exposes `survival_probability`,
+`marginal_default_probability` and `to_tensor` in exactly the engine's
+conventions (verified bit-identical on the flat overlap), so closing the gap is
+a small additive change to `cva.py`: accept an optional
+`survival_curve`/`marginal_default` tensor alongside the existing scalar path.
+Not done here — it is a different module than the one requested.
+
+Measured cost of the gap: on a declining 20→0 exposure profile over 10Y, the
+bootstrapped term structure gives a CVA differing from the 5Y credit-triangle
+flat-hazard approximation by more than 1%
+(`test_engine_cva_responds_to_the_credit_term_structure`).
 
 ### Phase 6 benchmark — written, NEVER RUN
 
