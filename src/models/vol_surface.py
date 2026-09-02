@@ -124,6 +124,11 @@ __all__ = [
     "LocalVolatilitySurface",
     "SurfaceCalibrationResult",
     "calibrate_surface",
+    "LocalVolFit",
+    "local_vol_sampling_grid",
+    "fit_local_vol_params",
+    "evaluate_parametric_local_vol",
+    "DEFAULT_FIT_SIGMA_WIDTH",
 ]
 
 
@@ -917,4 +922,398 @@ def calibrate_surface(
         history=history,
         final_rmse=final_rmse,
         iterations=iterations,
+    )
+
+
+# ==========================================================================
+# Bridge: calibrated SSVI -> Phase 6 local-vol kernel parameters
+# ==========================================================================
+#: Default half-width of the sampling region, in standard deviations of
+#: :math:`\log S_T`. Three sigma covers ~99.7% of the terminal distribution;
+#: widening it trades accuracy where the diffusion actually goes for accuracy
+#: in a tail the Monte Carlo barely visits.
+DEFAULT_FIT_SIGMA_WIDTH = 3.0
+
+
+@dataclass(frozen=True)
+class LocalVolFit:
+    r"""A parametric local-vol surface fitted to a Dupire :math:`\sigma_{LV}`.
+
+    The Phase 6 Triton kernel evaluates
+
+    .. math::
+        \sigma(t, x) = \sigma_0
+                     + \sigma_{\text{skew}}\tanh(\kappa(x - x_{\text{ref}}))
+                     + \sigma_{\text{term}}\, t,
+        \qquad x = \log S,
+
+    which is a *four-parameter* form. A Dupire surface implied by SSVI has no
+    reason to lie in that family, so this is a projection, not an identity. The
+    diagnostics are therefore part of the result rather than an afterthought:
+    quoting kernel output without them would hide how much of the calibrated
+    surface was discarded on the way in.
+
+    Attributes:
+        base: :math:`\sigma_0`, the level.
+        skew: :math:`\sigma_{\text{skew}}`, the tanh amplitude.
+        kappa: :math:`\kappa`, the tanh steepness in log-spot.
+        term: :math:`\sigma_{\text{term}}`, the linear term-structure slope.
+        reference: :math:`x_{\text{ref}}`, pinned to :math:`\log S_0`. Not
+            fitted: the kernel's ``tanh`` saturates once
+            :math:`|\kappa(x - x_{\text{ref}})| \gtrsim 3`, so an uncentred
+            reference drives :math:`\partial\sigma/\partial x` to ~1e-5 and
+            silently reduces the kernel to the constant-volatility case.
+        rmse: Root-mean-square error in volatility units, density-weighted if
+            the fit was.
+        max_abs_error: Worst pointwise error over the sampled grid.
+        relative_rmse: ``rmse`` divided by the mean target volatility.
+        r_squared: Fraction of the target's weighted variance explained. Near
+            zero means the tanh form captured the *level* only.
+        n_samples: Grid points used.
+        target_range: ``(min, max)`` of the sampled :math:`\sigma_{LV}`.
+        fitted_range: ``(min, max)`` of the fitted surface on the same grid.
+        variance_floor_fraction: Share of grid points where the Dupire
+            variance floor was binding. A large value means the *target* was
+            already regularisation, so the fit error understates true model
+            error.
+        density_weighted: Whether the lognormal transition density was used.
+    """
+
+    base: float
+    skew: float
+    kappa: float
+    term: float
+    reference: float
+    rmse: float
+    max_abs_error: float
+    relative_rmse: float
+    r_squared: float
+    n_samples: int
+    target_range: Tuple[float, float]
+    fitted_range: Tuple[float, float]
+    variance_floor_fraction: float
+    density_weighted: bool
+
+    def to_local_vol_params(self) -> "object":
+        """Convert to the kernel's ``LocalVolParams``.
+
+        Imported lazily so ``src.models`` carries no hard dependency on
+        ``src.csrc`` -- the models layer must stay importable on a machine with
+        no Triton, which is where most of this project was developed.
+
+        Returns:
+            A :class:`src.csrc.triton_local_vol_cva.LocalVolParams`.
+        """
+        from src.csrc.triton_local_vol_cva import LocalVolParams
+
+        return LocalVolParams(
+            base=self.base,
+            skew=self.skew,
+            kappa=self.kappa,
+            term=self.term,
+            reference=self.reference,
+        )
+
+    @property
+    def is_well_fitted(self) -> bool:
+        """Whether the projection is tight enough to quote without caveat.
+
+        The 2% relative-RMSE threshold is a judgement, not a theorem: it is
+        roughly the bid-ask width on a liquid equity vol quote, so a fit inside
+        it is not the dominant error in the pipeline. Read ``relative_rmse``
+        directly rather than relying on this flag for anything quantitative.
+        """
+        return self.relative_rmse < 0.02
+
+    def summary(self) -> str:
+        """A human-readable report of the fit and its quality."""
+        verdict = "OK" if self.is_well_fitted else "POOR -- see note below"
+        lines = [
+            "SSVI -> Phase 6 local-vol parameter fit",
+            f"  sigma(t,x) = {self.base:.6f} "
+            f"{'+' if self.skew >= 0 else '-'} {abs(self.skew):.6f}"
+            f"*tanh({self.kappa:.6f}*(x - {self.reference:.6f})) "
+            f"{'+' if self.term >= 0 else '-'} {abs(self.term):.6f}*t",
+            "",
+            f"  samples            : {self.n_samples:,}"
+            f"{' (density-weighted)' if self.density_weighted else ''}",
+            f"  RMSE               : {self.rmse:.6f} vol",
+            f"  relative RMSE      : {self.relative_rmse:.3%}   [{verdict}]",
+            f"  max abs error      : {self.max_abs_error:.6f} vol",
+            f"  R^2                : {self.r_squared:.6f}",
+            f"  target sigma range : "
+            f"{self.target_range[0]:.4f} to {self.target_range[1]:.4f}",
+            f"  fitted sigma range : "
+            f"{self.fitted_range[0]:.4f} to {self.fitted_range[1]:.4f}",
+            f"  variance floor hit : {self.variance_floor_fraction:.2%} "
+            "of grid points",
+        ]
+        if not self.is_well_fitted:
+            lines += [
+                "",
+                "  The four-parameter tanh form cannot represent this Dupire",
+                "  surface to quoting accuracy. Kernel gradients will be with",
+                "  respect to the FITTED surface, not the calibrated SSVI one.",
+                "  Options: narrow the maturity window (the kernel's term",
+                "  structure is linear, so a long window strains it), or extend",
+                "  the kernel to a Chebyshev expansion in (t, log S).",
+            ]
+        if self.variance_floor_fraction > 0.05:
+            lines += [
+                "",
+                f"  WARNING: the Dupire variance floor bound at "
+                f"{self.variance_floor_fraction:.1%} of grid points, so the",
+                "  target is partly regularisation rather than surface.",
+            ]
+        return "\n".join(lines)
+
+
+def local_vol_sampling_grid(
+    spot_zero: float,
+    maturity: float,
+    *,
+    n_time: int = 24,
+    n_space: int = 41,
+    reference_vol: float = 0.2,
+    sigma_width: float = DEFAULT_FIT_SIGMA_WIDTH,
+    dtype: torch.dtype = torch.float64,
+) -> Tuple[Tensor, Tensor]:
+    r"""A :math:`(t, \log S)` grid covering where the diffusion actually goes.
+
+    The half-width grows as :math:`\sigma\sqrt{t}`, so the grid is a *cone*,
+    not a box. A box would spend most of its points on states unreachable at
+    short maturities, and the fit would then trade accuracy near the money --
+    where nearly all exposure sits -- for accuracy in a corner the simulation
+    never visits.
+
+    Time starts at ``maturity / n_time`` rather than zero: the Dupire surface
+    is undefined at :math:`T = 0` and the transition density is degenerate
+    there.
+
+    Args:
+        spot_zero: :math:`S_0`.
+        maturity: Longest maturity to cover, in years.
+        n_time: Time nodes.
+        n_space: Log-spot nodes per time slice.
+        reference_vol: Volatility scale setting the cone width.
+        sigma_width: Half-width in standard deviations.
+        dtype: Output dtype.
+
+    Returns:
+        ``(time, log_spot)``, both shape ``(n_time, n_space)``.
+
+    Raises:
+        ValueError: On non-positive or degenerate inputs.
+    """
+    if spot_zero <= 0.0:
+        raise ValueError(f"spot_zero must be positive, got {spot_zero}")
+    if maturity <= 0.0:
+        raise ValueError(f"maturity must be positive, got {maturity}")
+    if n_time < 1 or n_space < 2:
+        raise ValueError(
+            f"need n_time >= 1 and n_space >= 2, got {n_time}, {n_space}"
+        )
+    if reference_vol <= 0.0 or sigma_width <= 0.0:
+        raise ValueError("reference_vol and sigma_width must be positive")
+
+    time = torch.linspace(
+        maturity / n_time, maturity, n_time, dtype=dtype
+    ).reshape(-1, 1)
+    unit = torch.linspace(-1.0, 1.0, n_space, dtype=dtype).reshape(1, -1)
+    half_width = sigma_width * reference_vol * torch.sqrt(time)
+    log_spot = math.log(spot_zero) + unit * half_width
+    return time.expand(n_time, n_space), log_spot
+
+
+def fit_local_vol_params(
+    local_vol: LocalVolatilitySurface,
+    spot_zero: float,
+    maturity: float,
+    *,
+    drift: float = 0.0,
+    n_time: int = 24,
+    n_space: int = 41,
+    reference_vol: float = 0.2,
+    sigma_width: float = DEFAULT_FIT_SIGMA_WIDTH,
+    density_weighted: bool = True,
+    iterations: int = 600,
+    learning_rate: float = 5e-2,
+) -> LocalVolFit:
+    r"""Project a Dupire :math:`\sigma_{LV}` onto the Phase 6 kernel's form.
+
+    This is the missing link between the calibrated SSVI surface and the
+    Phase 6 Triton kernel. The kernel does not read an ``SSVISurface``: it
+    evaluates a four-parameter ``tanh`` surface in registers, because a gather
+    from a Dupire grid would serialise every warp. SSVI therefore has to be
+    *projected* onto that family, and the projection error is a real modelling
+    cost that :class:`LocalVolFit` reports rather than hides.
+
+    Fitting is a weighted least squares in volatility units:
+
+    .. math::
+        \min_{\sigma_0, \sigma_{\text{skew}}, \kappa, \sigma_{\text{term}}}
+        \sum_i \omega_i \bigl(\hat\sigma(t_i, x_i)
+        - \sigma_{LV}(t_i, x_i)\bigr)^2
+
+    with :math:`\omega_i` the lognormal transition density when
+    ``density_weighted``. The weighting matters more than it appears: an
+    unweighted fit treats a state three sigma out at :math:`t = 0.1` as equally
+    important as the money, and the result is visibly wrong exactly where the
+    exposure is.
+
+    :math:`\sigma_0` and :math:`\kappa` are fitted through ``softplus`` so they
+    stay strictly positive, which the kernel's ``LocalVolParams`` validates.
+    An unconstrained optimiser happily reaches a negative :math:`\kappa` -- an
+    observationally equivalent surface with flipped skew -- which then fails
+    validation downstream for no obvious reason.
+
+    :math:`x_{\text{ref}}` is **not** fitted; it is pinned to
+    :math:`\log S_0`. See :attr:`LocalVolFit.reference`.
+
+    Args:
+        local_vol: The Dupire surface built on a calibrated SSVI surface.
+        spot_zero: :math:`S_0`.
+        maturity: Longest maturity the kernel will simulate to.
+        drift: :math:`\mu`, used for the density weights only.
+        n_time: Time nodes in the sampling grid.
+        n_space: Log-spot nodes per slice.
+        reference_vol: Volatility scale for the sampling cone and the weights.
+        sigma_width: Grid half-width in standard deviations.
+        density_weighted: Weight by the lognormal transition density.
+        iterations: Adam steps.
+        learning_rate: Adam learning rate.
+
+    Returns:
+        A :class:`LocalVolFit` holding the parameters and the fit diagnostics.
+
+    Raises:
+        ValueError: On invalid grid or optimiser settings.
+    """
+    if iterations < 1:
+        raise ValueError(f"iterations must be positive, got {iterations}")
+    if learning_rate <= 0.0:
+        raise ValueError(f"learning_rate must be positive, got {learning_rate}")
+
+    time, log_spot = local_vol_sampling_grid(
+        spot_zero,
+        maturity,
+        n_time=n_time,
+        n_space=n_space,
+        reference_vol=reference_vol,
+        sigma_width=sigma_width,
+        dtype=torch.float64,
+    )
+    reference = math.log(spot_zero)
+
+    # The target is a fixed surface: this projects onto the kernel's family, it
+    # does not co-calibrate SSVI. So the result is detached -- but it must NOT
+    # be computed under no_grad. Dupire local variance is *defined* by
+    # autodiff of the total-variance surface (d_T w / g), so suppressing grad
+    # removes the derivative the target is made of and raises "element 0 of
+    # tensors does not require grad". enable_grad is explicit rather than
+    # implicit so that calling this from inside a no_grad block still works.
+    with torch.enable_grad():
+        spot = torch.exp(log_spot.detach().requires_grad_(False))
+        target = (
+            local_vol.local_volatility(spot, time, spot_zero).double().detach()
+        )
+    floor_fraction = float(
+        (target <= math.sqrt(local_vol.variance_floor) + 1e-12)
+        .to(target.dtype)
+        .mean()
+    )
+
+    if density_weighted:
+        # log S_t ~ N(log S0 + (mu - sigma^2/2) t, sigma^2 t)
+        centre = reference + (drift - 0.5 * reference_vol**2) * time
+        variance = (reference_vol**2) * time
+        weights = torch.exp(
+            -0.5 * (log_spot - centre) ** 2 / variance
+        ) / torch.sqrt(variance)
+    else:
+        weights = torch.ones_like(target)
+    weights = weights / weights.sum()
+
+    # softplus-parameterised, so base > 0 and kappa > 0 by construction.
+    raw_base = torch.tensor(
+        math.log(math.expm1(max(float(target.mean()), 1e-3))),
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    raw_kappa = torch.tensor(
+        math.log(math.expm1(2.5)), dtype=torch.float64, requires_grad=True
+    )
+    skew = torch.zeros((), dtype=torch.float64, requires_grad=True)
+    term = torch.zeros((), dtype=torch.float64, requires_grad=True)
+
+    optimiser = torch.optim.Adam(
+        [raw_base, raw_kappa, skew, term], lr=learning_rate
+    )
+    centred = log_spot - reference
+
+    def model() -> Tensor:
+        base = torch.nn.functional.softplus(raw_base)
+        kappa = torch.nn.functional.softplus(raw_kappa)
+        return base + skew * torch.tanh(kappa * centred) + term * time
+
+    # enable_grad again, and around the whole loop: an outer no_grad context
+    # would leave `loss` without a grad_fn and backward() would fail. Callers
+    # do wrap analysis code in no_grad, so this has to be robust to it.
+    with torch.enable_grad():
+        for _ in range(iterations):
+            optimiser.zero_grad(set_to_none=True)
+            loss = (weights * (model() - target) ** 2).sum()
+            loss.backward()
+            optimiser.step()
+
+    with torch.no_grad():
+        fitted = model()
+        residual = fitted - target
+        rmse = float(torch.sqrt((weights * residual**2).sum()))
+        mean_target = float((weights * target).sum())
+        total_variance = float((weights * (target - mean_target) ** 2).sum())
+        r_squared = (
+            1.0 - (rmse**2) / total_variance if total_variance > 0.0 else 1.0
+        )
+
+        return LocalVolFit(
+            base=float(torch.nn.functional.softplus(raw_base)),
+            skew=float(skew),
+            kappa=float(torch.nn.functional.softplus(raw_kappa)),
+            term=float(term),
+            reference=reference,
+            rmse=rmse,
+            max_abs_error=float(residual.abs().max()),
+            relative_rmse=(
+                rmse / mean_target if mean_target > 0.0 else float("inf")
+            ),
+            r_squared=r_squared,
+            n_samples=int(target.numel()),
+            target_range=(float(target.min()), float(target.max())),
+            fitted_range=(float(fitted.min()), float(fitted.max())),
+            variance_floor_fraction=floor_fraction,
+            density_weighted=density_weighted,
+        )
+
+
+def evaluate_parametric_local_vol(
+    fit: LocalVolFit, time: Tensor, log_spot: Tensor
+) -> Tensor:
+    r"""Evaluate the fitted surface, matching the kernel's arithmetic exactly.
+
+    Useful for plotting the projection against its Dupire target, and for
+    checking on the host what the kernel computes on the device.
+
+    Args:
+        fit: A :class:`LocalVolFit`.
+        time: :math:`t`, any shape.
+        log_spot: :math:`x = \log S`, broadcastable with ``time``.
+
+    Returns:
+        :math:`\sigma(t, x)`, broadcast shape.
+    """
+    return (
+        fit.base
+        + fit.skew * torch.tanh(fit.kappa * (log_spot - fit.reference))
+        + fit.term * time
     )

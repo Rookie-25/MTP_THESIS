@@ -147,6 +147,9 @@ xva-cuda-engine/
 │   │                               # M to 50M, pre-flight VRAM guard, O(N) memory evidence
 │   ├── bench_phase4.py             # Phase 3 (dW in HBM) vs Phase 4 (in-kernel Philox);
 │   │                               # M up to 20M, reports the OOM crossover + ceiling analysis
+│   ├── plot_results.py             # publication figures: time vs M, VRAM vs M,
+│   │                               # EE/PFE with and without collateral.
+│   │                               # Validated palette; refuses to invent data.
 │   └── bench_phase6.py             # Phase 6 Triton local-vol AAD vs PyTorch autograd.
 │                                   # Forward time, backward time (CUDA events around
 │                                   # .backward() ALONE), and peak VRAM -- each stage
@@ -170,7 +173,9 @@ xva-cuda-engine/
     ├── test_phase6.py              # 44 tests: surface, arbitrage penalties, non-linear adjoint
     │                               # (CPU only -- the maths was settled before any Triton)
     └── test_phase6_kernel.py       # 51 tests: 42 CPU-tier passing, 9 GPU-tier NEVER RUN
-    └── test_market_data.py         # 130 tests: 124 passing, 6 network-tier opt-in
+    ├── test_market_data.py         # 130 tests: 124 passing, 6 network-tier opt-in
+    └── test_credit_curve_integration.py  # 61 tests: piecewise credit AAD,
+                                    # SSVI->kernel bridge, figure parsing
 ```
 
 **Full suite: 219 passed, 65 skipped** (`python -m pytest tests/ -q`, ~40s on CPU).
@@ -541,7 +546,11 @@ log-moneyness. Output feeds `calibrate_surface` directly (verified end to end).
    the flag exists to suppress. Now expands in whichever direction the sign at
    each end indicates.
 
-**OPEN GAP — the bootstrapped curve cannot yet reach the CVA engine.**
+**GAP CLOSED (see the credit term structure section below).** The text that
+follows describes why it existed; the injection point now exists in
+`src/xva/cva.py` as `credit_curve=`/`survival=`, with per-pillar AAD.
+
+**Original note — the bootstrapped curve could not reach the CVA engine.**
 `src/xva/cva.py::_integrate_credit_leg` takes `hazard_rate` as a **scalar** and
 builds the flat-intensity curve internally via
 `marginal_default_probability(grid, hazard_rate)`. There is no parameter for an
@@ -557,6 +566,168 @@ Measured cost of the gap: on a declining 20→0 exposure profile over 10Y, the
 bootstrapped term structure gives a CVA differing from the 5Y credit-triangle
 flat-hazard approximation by more than 1%
 (`test_engine_cva_responds_to_the_credit_term_structure`).
+
+### Credit term structure now reaches the CVA engine — CLOSED (61 tests)
+
+`src/xva/cva.py`. The gap recorded in the market-data section is closed:
+`_integrate_credit_leg` no longer builds the flat curve internally. Three
+credit specifications, exactly one required:
+
+| argument | meaning |
+|---|---|
+| `hazard_rate=` | flat intensity — the pre-existing path, **unchanged** |
+| `credit_curve=` | `PiecewiseHazard`, or a duck-typed `market_data` `CreditCurve` |
+| `survival=` | an explicit `Q(t)` tensor on the grid |
+
+`hazard_rate` is still the third positional argument (it merely became
+optional), so every existing call site is untouched — confirmed by the 454
+pre-existing tests still passing.
+
+**AAD was the substance, not the plumbing.** Reading NumPy survival values out
+of a bootstrapped curve yields a *constant*: the backward pass then succeeds
+with an all-zero gradient and every credit sensitivity is silently gone. So
+`PiecewiseHazard` keeps the hazard vector in torch and rebuilds `Q` from it:
+
+    H(t) = sum_j h_j * clamp(min(t, T_j) - T_{j-1}, min=0)
+
+which is *linear* in `h`, so one backward pass yields every
+`dCVA/dh_j` — the bucketed credit deltas a desk hedges with, not one lumped
+sensitivity to a flat intensity.
+
+Verified:
+
+- **Bucket deltas match central finite differences to 2e-11 relative**, per
+  pillar (`cva_credit_bucket_deltas`).
+- **Torch piecewise `Q` == NumPy `CreditCurve.survival_probability`** to
+  1.1e-16.
+- **A one-pillar curve is bit-identical to the flat path** (`torch.equal`) for
+  both survival and the marginal-default convention. Exact, not close — both
+  compute `exp(-h t)`, so any difference would mean the overlap arithmetic is
+  not reducing.
+- Flat extrapolation past the last pillar holds the final hazard, verified by
+  recovering it from `Q(15)`/`Q(20)`. Dropping it instead would make `Q` stop
+  decaying and understate CVA on any trade maturing beyond the longest quote —
+  a silent, one-directional error.
+- Term structure vs the 5Y credit triangle differs by >1% on a declining
+  exposure, so the curve is not cosmetic.
+
+**One constraint hit, worth recording:** `aad_greeks` reduces every gradient
+with `float(grad.detach())` and is therefore **scalar-only** — it cannot carry
+a per-pillar delta vector. Rather than change `greeks.py` (and the tests
+resting on it), `make_cva_valuation_fn(credit_curve=...)` exposes a scalar
+`"hazard_shift"`: a parallel shift of the whole curve, which is a quantity
+desks quote anyway, so it composes with the existing greeks API unchanged. The
+bucketed vector lives in `cva_credit_bucket_deltas`, where it can be returned
+as a tensor. `compute_xva` gained `credit_curve=`/`own_credit_curve=`, and
+`XVAResult.hazard_rate` is now `Optional[float]` — `None` under a curve,
+because reporting a summary intensity would invite it being quoted as if it
+had been the input.
+
+`cva.py` deliberately does **not** import `market_data`: the dependency runs
+data-layer -> engine, and reversing it would make the engine depend on its own
+data layer. `CreditCurve` is duck-typed on `(pillar_times, hazard_rates)`.
+
+### SSVI -> Phase 6 kernel bridge — WRITTEN, and it is a lossy projection
+
+`src/models/vol_surface.py`: `LocalVolFit`, `fit_local_vol_params`,
+`local_vol_sampling_grid`, `evaluate_parametric_local_vol`.
+
+Fits the kernel's four-parameter surface
+`sigma(t,x) = base + skew*tanh(kappa*(x - x_ref)) + term*t` to the Dupire
+`sigma_LV` implied by a calibrated `SSVISurface`, by weighted least squares in
+volatility units. `to_local_vol_params()` hands the result straight to the
+Phase 6 kernel (lazy import, so `src.models` keeps no hard dependency on
+`src.csrc`).
+
+**This is a projection, not an identity, and the loss is material.** Measured
+against an SSVI surface with `rho=-0.35, eta=1.2, gamma=0.45`, relative RMSE
+against sampling width:
+
+| cone half-width | rel. RMSE | R^2 | target sigma range |
+|---|---|---|---|
+| 0.5 sigma | 3.47% | 0.879 | 0.167-0.237 |
+| 1.0 sigma | 6.81% | 0.831 | 0.167-0.286 |
+| 1.5 sigma | 10.66% | 0.729 | 0.167-0.333 |
+| 2.0 sigma | 13.59% | 0.646 | 0.167-0.374 |
+| 3.0 sigma | 15.99% | 0.578 | 0.167-0.447 |
+
+The tanh saturates, so it cannot follow a steep Dupire wing: at 3 sigma the
+target reaches 0.447 while the fitted surface tops out near 0.287. **Phase 6
+gradients are therefore with respect to the FITTED surface, not the calibrated
+SSVI one**, and `LocalVolFit.summary()` says so whenever relative RMSE exceeds
+2%. Quoting kernel output without those diagnostics would hide how much of the
+calibrated surface was discarded on the way in. A tighter coupling needs the
+Chebyshev extension already noted for the kernel.
+
+Identifiability is checked first: against a target that *is* in the tanh family
+the fitter recovers `(base, skew, kappa, term)` to **8e-6**. Without that check
+a residual against a real surface could be the projection or the optimiser with
+no way to tell.
+
+Design points: the sampling grid is a **cone** (half-width growing as
+`sigma*sqrt(t)`), not a box, so points are not spent on states unreachable at
+short maturities; quotes are weighted by the lognormal transition density
+(unweighted fitting moved `base` from 0.218 to 0.263 and worsened relative RMSE
+from 15.9% to 21.1%); `base` and `kappa` are fitted through `softplus` because
+an unconstrained optimiser reaches a negative `kappa` — an observationally
+equivalent surface with flipped skew — which then fails `LocalVolParams`
+validation for no apparent reason; `x_ref` is **pinned** to `log(S0)`, never
+fitted, because an uncentred tanh saturates and silently reduces Phase 6 to the
+constant-vol case.
+
+**Bug found and fixed while wiring it:** the target evaluation was wrapped in
+`torch.no_grad()`. Dupire local variance is *defined* by autodiff of the
+total-variance surface (`d_T w / g`), so suppressing grad removed the
+derivative the target is made of, raising `element 0 of tensors does not
+require grad`. Fixed with explicit `torch.enable_grad()` — needed **twice**,
+once for the target and once around the optimisation loop, since an outer
+`no_grad` also leaves the loss without a `grad_fn`.
+
+### Figures — `benchmarks/plot_results.py`
+
+Three publication-ready figures, PNG + PDF + a companion CSV of the plotted
+values (a figure alone is not accessible).
+
+1. **Execution time vs M** — log-log, one line per backend.
+2. **Peak VRAM vs M** — log-log, with the device capacity as a reference line,
+   so the OOM cliff is visibly the intersection of an `O(M*N)` line with a
+   fixed ceiling rather than lines stopping for no reason.
+3. **Exposure profiles** — EE and PFE with and without a CSA. Computed **live
+   on CPU** from `src.xva`, so it needs no GPU and no benchmark file: it is a
+   property of the model, not the hardware.
+
+Figures 1 and 2 parse the Markdown `bench_all_phases.py --markdown` writes.
+**`results.md` does not exist yet**, so they are skipped with the command that
+produces them. No placeholder data is ever plotted — a benchmark figure showing
+invented numbers is worse than a missing figure. An OOM cell parses to `None`,
+never `0`: plotting zero would put a point at exactly the place the finding
+lives and make a backend that died look infinitely fast.
+
+Palette chosen by the project's data-viz validator, not by taste. The obvious
+fourth series colour, yellow, **fails** the all-pairs normal-vision gate
+against orange (Delta E 13.7, below the floor of 15) — readers with ordinary
+colour vision cannot reliably separate them. Blue / orange / aqua / violet
+passes both adjacent and all-pairs gates (worst all-pairs normal Delta E 16.3,
+CVD 9.2). Aqua sits at 2.82:1 on white, below the 3:1 bar, so every series also
+carries a direct end-of-line label — the documented relief, which doubles as
+the redundant encoding that keeps the figures readable in greyscale print.
+Colour follows the entity, so a backend keeps its hue across both figures, with
+line style and marker varying too. Figure 3 encodes the metric in colour and
+the CSA in line style rather than giving four series four hues, because the
+comparison a reader needs is within each metric. **No dual-axis figure** — time
+and memory get one axis each.
+
+Layout defects were found by rendering and looking, not by reading the code:
+end-of-line labels clipped at the right spine (fixed with reserved x headroom),
+the legend colliding with the capacity annotation (moved below the axes), the
+OOM marker landing on top of the series label (folded into one text object),
+and a "PFE peak" annotation that was both clipped and redundant — the profile
+rises monotonically to maturity, so the peak is always the last point (replaced
+with terminal-value labels).
+
+Measured on the default single-swap netting set (20,000 paths, 5Y, threshold 5,
+MTA 1, MPOR 10bd): the CSA removes **83% of aggregate EE and 88% of peak PFE**,
+with `EE_collat <= EE_uncollat` pointwise as Phase 2 asserts.
 
 ### Phase 6 benchmark — written, NEVER RUN
 
