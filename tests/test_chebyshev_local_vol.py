@@ -9,14 +9,14 @@ Two tiers, matching this project's established pattern:
   fit identifiability, and the actual before/after wing-saturation
   measurement against the tanh basis.
 * **Tier 2 (GPU, opt-in)** -- the Triton kernel itself. Gated by
-  ``@requires_triton`` like every other GPU tier in this repository. Because
-  no Triton install or CUDA device was available while writing
-  ``src/csrc/triton_chebyshev_local_vol_cva.py``, these tests have **never
-  been run**; they exist so the first Colab session can execute them
-  immediately, exactly as every prior Phase 6 GPU test did before its first
-  run. See that module's docstring for the specific pattern flagged as
-  highest-risk (a Python list of accumulators over a ``tl.constexpr``-length
-  range).
+  ``@requires_triton`` like every other GPU tier in this repository. These
+  ran once on a T4 and failed to compile, which is what
+  ``TestRuntimeLoopVariableGuards`` now pins down: ``for k in range(...)``
+  inside ``@triton.jit`` yields a runtime ``tl.tensor``, not a Python
+  ``int``, so ``float(k)`` and ``list[k]`` are both compile errors. Those
+  guards are *static source checks* rather than executions, because the
+  machine this kernel is developed on has no Triton -- the same reasoning
+  behind ``tests/test_phase4.py::TestGlobalPointerAddressing``.
 """
 
 from __future__ import annotations
@@ -306,21 +306,32 @@ class TestChebyshevFit:
 # ==========================================================================
 # THE ACTUAL FIX: measured before/after
 # ==========================================================================
+@pytest.fixture(scope="module")
+def local_vol() -> LocalVolatilitySurface:
+    """The SSVI-implied Dupire surface the wing-saturation tests compare on.
+
+    Deliberately a **module-level** fixture rather than a class-scoped method.
+    Defining a class-scoped fixture as an instance method is deprecated in
+    pytest 10, and the obvious workaround -- stacking ``@classmethod`` over
+    ``@pytest.fixture`` -- is silently version-dependent: pytest 9.x unwraps
+    the descriptor to find the fixture marker, pytest 8.4.2 does not and
+    reports ``fixture 'local_vol' not found``. A plain module-level fixture
+    involves no descriptor at all, keeps the same caching, and behaves
+    identically on every pytest version.
+    """
+    knots = torch.tensor([0.1, 0.25, 0.5, 1.0, 2.0], dtype=torch.float64)
+    surface = SSVISurface(
+        atm=ATMTotalVariance(knots), rho=-0.35, eta=1.2, gamma=0.45
+    ).double()
+    return LocalVolatilitySurface(surface, rate=0.02)
+
+
 class TestWingSaturationFix:
     """Direct evidence the Chebyshev basis fixes what the tanh basis could not.
 
     Same SSVI surface, same sampling width, same evaluation grid -- only the
     basis differs. This is the comparison the whole file exists to support.
     """
-
-    @classmethod
-    @pytest.fixture(scope="class")
-    def local_vol(cls) -> LocalVolatilitySurface:
-        knots = torch.tensor([0.1, 0.25, 0.5, 1.0, 2.0], dtype=torch.float64)
-        surface = SSVISurface(
-            atm=ATMTotalVariance(knots), rho=-0.35, eta=1.2, gamma=0.45
-        ).double()
-        return LocalVolatilitySurface(surface, rate=0.02)
 
     def test_chebyshev_beats_tanh_at_three_sigma(
         self, local_vol: LocalVolatilitySurface
@@ -689,3 +700,156 @@ class TestChebyshevKernelGPU:
                 value(SPOT, bumped_up).item() - value(SPOT, bumped_down).item()
             ) / (2 * step)
             assert coefficients.grad[k].item() == pytest.approx(finite, rel=5e-3)
+
+
+# ==========================================================================
+# Regression guards for the first-compile failures
+# ==========================================================================
+class TestRuntimeLoopVariableGuards:
+    r"""Static guards for the two bugs the first T4 compile exposed.
+
+    Both stem from one misconception: ``for k in range(...)`` inside
+    ``@triton.jit`` does **not** unroll at trace time. Triton lowers it to a
+    runtime loop and ``k`` becomes a ``tl.tensor``, so anything treating it as
+    a Python ``int`` fails at compile time:
+
+    * ``float(k)`` raised ``TypeError: float() argument must be a string or a
+      real number, not 'tensor'``;
+    * ``acc_coeff[k]`` -- a Python list indexed by the loop variable -- would
+      have failed identically once the forward compiled.
+
+    These are source-level checks because neither can be caught by running
+    anything on a machine without Triton, which is where this kernel is
+    developed. Same rationale as
+    ``tests/test_phase4.py::TestGlobalPointerAddressing``, which guards the
+    int64 pointer fix the same way.
+    """
+
+    @staticmethod
+    def _jit_functions():
+        """Every ``@triton.jit``-decorated function in the Chebyshev module."""
+        import ast
+        import inspect
+
+        import src.csrc.triton_chebyshev_local_vol_cva as module
+
+        tree = ast.parse(inspect.getsource(module))
+        jitted = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for decorator in node.decorator_list:
+                name = getattr(decorator, "attr", getattr(decorator, "id", ""))
+                if name == "jit":
+                    jitted.append(node)
+        return jitted
+
+    def test_the_module_actually_has_jit_kernels(self) -> None:
+        """Guard the guard: an import rename must not silently empty these tests."""
+        names = [function.name for function in self._jit_functions()]
+        assert len(names) >= 3, names
+        assert "_fused_chebyshev_local_vol_forward_kernel" in names
+        assert "_fused_chebyshev_local_vol_backward_kernel" in names
+
+    def test_no_python_float_cast_inside_a_kernel(self) -> None:
+        """``float(x)`` on a traced value is a compile error, not a cast."""
+        import ast
+
+        offenders = []
+        for function in self._jit_functions():
+            for node in ast.walk(function):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "float"
+                ):
+                    offenders.append(f"{function.name}:{node.lineno}")
+        assert not offenders, (
+            "float() applied to a value inside @triton.jit; the loop index is "
+            f"a tl.tensor, not a Python int: {offenders}"
+        )
+
+    def test_no_python_container_indexed_by_a_loop_variable(self) -> None:
+        """A ``for`` target is a runtime tensor; it cannot index a Python list.
+
+        The proven tanh kernel selects by masked comparison
+        (``tl.where(offs[None, :] == k, ...)``) precisely for this reason, and
+        this module must do the same.
+        """
+        import ast
+
+        offenders = []
+        for function in self._jit_functions():
+            for loop in ast.walk(function):
+                if not isinstance(loop, ast.For):
+                    continue
+                if not isinstance(loop.target, ast.Name):
+                    continue
+                target = loop.target.id
+                for node in ast.walk(loop):
+                    if (
+                        isinstance(node, ast.Subscript)
+                        and isinstance(node.slice, ast.Name)
+                        and node.slice.id == target
+                    ):
+                        offenders.append(
+                            f"{function.name}:{node.lineno} indexes by {target!r}"
+                        )
+        assert not offenders, (
+            "Python container indexed by a Triton loop variable; use a masked "
+            f"tile instead: {offenders}"
+        )
+
+
+class TestFoldedDerivativeCoefficients:
+    r"""The host-side trick that removed :math:`k` from the kernel arithmetic.
+
+    :math:`\frac{d}{du}\sum_k c_k T_k(u) = \sum_{k\ge1} (k c_k) U_{k-1}(u)`,
+    so precomputing :math:`\hat c_k = k c_k` on the host lets the kernel form
+    the derivative with no arithmetic on its loop index at all. If this
+    identity is ever broken, every Chebyshev kernel gradient is silently
+    wrong, so it is checked directly against the independently-verified
+    :func:`chebyshev_basis_derivative`.
+    """
+
+    @pytest.mark.parametrize("degree", [0, 1, 2, 3, 5, 8, 12])
+    def test_folded_coefficients_reproduce_the_derivative(self, degree: int) -> None:
+        generator = torch.Generator().manual_seed(SEED + degree)
+        coefficients = torch.randn(degree + 1, dtype=torch.float64, generator=generator)
+        u = torch.linspace(-1.3, 1.3, 33, dtype=torch.float64)
+
+        expected = torch.tensordot(
+            coefficients, chebyshev_basis_derivative(u, degree), dims=([0], [0])
+        )
+
+        # What the host packs and the kernel consumes.
+        folded = torch.arange(degree + 1, dtype=torch.float64) * coefficients
+        ones = torch.ones_like(u)
+        got = torch.zeros_like(u)
+        if degree >= 1:
+            u_prev = ones                      # U_0
+            got = got + folded[1] * u_prev
+        if degree >= 2:
+            u_curr = 2.0 * u                   # U_1
+            got = got + folded[2] * u_curr
+            for k in range(3, degree + 1):
+                u_next = 2.0 * u * u_curr - u_prev
+                got = got + folded[k] * u_next
+                u_prev, u_curr = u_curr, u_next
+
+        torch.testing.assert_close(got, expected, rtol=1e-9, atol=1e-9)
+
+    def test_block_degree_is_a_power_of_two_covering_the_degree(self) -> None:
+        """``tl.arange`` needs a power-of-two length; the tail is masked off."""
+        from src.csrc.triton_chebyshev_local_vol_cva import chebyshev_block_degree
+
+        for degree in range(0, 33):
+            block = chebyshev_block_degree(degree)
+            assert block >= degree + 1
+            assert block & (block - 1) == 0, f"{block} is not a power of two"
+
+    def test_block_degree_rejects_negative(self) -> None:
+        from src.csrc.triton_chebyshev_local_vol_cva import chebyshev_block_degree
+
+        with pytest.raises(ValueError, match="non-negative"):
+            chebyshev_block_degree(-1)

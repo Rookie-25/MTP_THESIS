@@ -39,23 +39,45 @@ CPU (Tier 1)  Fully verified. :func:`reference_chebyshev_local_vol_ee` is
               :func:`reference_checkpointed_chebyshev_ee_adjoint`
               (sqrt(N) checkpointing) are both hand-derived and checked
               against it in ``tests/test_chebyshev_local_vol.py``.
-GPU (Tier 2)  **Written, never compiled.** No Triton install and no CUDA
-              device were available while writing this file. The kernel
-              mirrors ``_fused_local_vol_forward_kernel`` /
+GPU (Tier 2)  Compiled once on a T4 (Triton 3.6.0) and **failed**, then
+              fixed; see the note below. Written without a local Triton
+              install, so every construct is chosen to match
+              ``_fused_local_vol_forward_kernel`` /
               ``_fused_local_vol_backward_kernel`` primitive-for-primitive
               (``tl.where``, ``tl.exp``, ``tl.randn``, ``tl.load``,
               ``tl.maximum``, ``tl.sum`` -- nothing beyond what those two
-              kernels already prove compiles on the target), so the risk is
-              concentrated in one genuinely new pattern: a Python list of
-              ``tl.tensor`` accumulators, one per Chebyshev coefficient,
-              built by a ``range(DEGREE + 1)`` loop where ``DEGREE`` is a
-              ``tl.constexpr``. This is a standard idiom in published Triton
-              kernels (each iteration is unrolled into a separate SSA value
-              at trace time, exactly like this file's own ``BLOCK_CK``-length
-              loops already are), but it has not been exercised by any
-              kernel in this repository before now, so it is the first thing
-              to inspect on a Colab compile failure.
+              kernels already prove compiles on the target).
 ============  ===========================================================
+
+What the first compile taught us: ``range`` is not unrolled
+===========================================================
+An earlier version of this file assumed that ``for k in range(...)`` inside
+``@triton.jit`` unrolls at trace time and yields a Python ``int`` for ``k``
+whenever the bound is a ``tl.constexpr``. **That is false.** Triton lowers
+``range`` to a *runtime* loop and ``k`` becomes a ``tl.tensor``. Only
+``tl.static_range`` unrolls. Two things broke as a result:
+
+* ``float(k)`` raised ``TypeError: float() argument must be a string or a
+  real number, not 'tensor'`` -- the reported compile failure.
+* ``acc_coeff[k]``, a Python list of per-coefficient accumulators indexed by
+  the loop variable, would have failed identically the moment the forward
+  compiled.
+
+Both are fixed without ``tl.static_range`` (unverifiable from the development
+machine, and this project has already lost a round trip to assuming a
+``tl.*`` symbol exists). Instead:
+
+* the factor :math:`k` is folded into the coefficients host-side, so the
+  derivative sum carries no :math:`k` arithmetic at all
+  (:func:`_chebyshev_eval_and_deriv`);
+* the accumulator list became a masked ``(BLOCK_M, BLOCK_DEG)`` tile, which
+  is exactly the pattern the proven tanh kernel already uses for its
+  ``checkpoints`` and ``replay`` tiles, and for the same reason;
+* the value-only :func:`_chebyshev_eval` uses ``k`` for nothing but
+  ``tl.load(coeff_ptr + k)``, which is legal with a runtime offset.
+
+The remaining use of ``k`` -- ``offs_deg[None, :] == k`` -- is a tensor
+comparison, which is the intended way to select a column by a runtime index.
 
 Because the recursion, the checkpointing scheme, and the packed-parameter
 convention are copied from a kernel already proven on a T4, a GPU-side
@@ -81,6 +103,7 @@ from src.xva.exposure import validate_uniform_grid
 __all__ = [
     "ChebyshevLocalVolParams",
     "select_chebyshev_local_vol_blocks",
+    "chebyshev_block_degree",
     "chebyshev_local_vol_and_state_derivative",
     "reference_chebyshev_local_vol_ee",
     "reference_chebyshev_local_vol_ee_adjoint",
@@ -163,7 +186,7 @@ class ChebyshevLocalVolParams:
 
 
 def select_chebyshev_local_vol_blocks(
-    n_steps: int, element_size: int
+    n_steps: int, element_size: int, degree: int = 0
 ) -> Tuple[int, int]:
     r"""Choose ``(BLOCK_M, BLOCK_CK)``, identical rule to the tanh kernel.
 
@@ -176,6 +199,8 @@ def select_chebyshev_local_vol_blocks(
     Args:
         n_steps: Number of time steps :math:`N`.
         element_size: Bytes per element.
+        degree: Chebyshev degree, which sets the width of the two extra
+            coefficient tiles the backward pass holds.
 
     Returns:
         ``(BLOCK_M, BLOCK_CK)``.
@@ -184,10 +209,38 @@ def select_chebyshev_local_vol_blocks(
     while block_ck * block_ck < n_steps:
         block_ck *= 2
     block_ck = max(block_ck, 1)
-    tile_bytes = 2 * block_ck * element_size
+    # Four (BLOCK_M, *) tiles are live in the backward pass: checkpoints and
+    # replay (BLOCK_CK wide), plus the coefficient accumulator and the
+    # Chebyshev basis tile (BLOCK_DEG wide). The tanh kernel budgeted for two;
+    # under-counting here would silently cost occupancy rather than fail.
+    block_deg = chebyshev_block_degree(degree)
+    tile_bytes = 2 * (block_ck + block_deg) * element_size
     block_m = max(1, SRAM_TILE_BUDGET_BYTES // max(tile_bytes, 1))
     block_m = 1 << (block_m.bit_length() - 1) if block_m > 0 else 1
     return block_m, block_ck
+
+
+def chebyshev_block_degree(degree: int) -> int:
+    """Next power of two at or above ``degree + 1``.
+
+    ``tl.arange`` requires a power-of-two length, so the coefficient axis is
+    padded and the tail masked off -- the same treatment ``BLOCK_CK`` gets.
+
+    Args:
+        degree: Chebyshev degree :math:`K`.
+
+    Returns:
+        ``BLOCK_DEG``, at least 1.
+
+    Raises:
+        ValueError: If ``degree`` is negative.
+    """
+    if degree < 0:
+        raise ValueError(f"degree must be non-negative, got {degree}")
+    block_deg = 1
+    while block_deg < degree + 1:
+        block_deg *= 2
+    return block_deg
 
 
 # ==========================================================================
@@ -561,60 +614,104 @@ def reference_checkpointed_chebyshev_ee_adjoint(
 # Triton device code -- NEVER COMPILED, see the module docstring
 # ==========================================================================
 @triton.jit
-def _chebyshev_eval_and_deriv(u, coeff_ptr, degree: tl.constexpr):
-    r"""Evaluate :math:`\sum_k c_k T_k(u)` and :math:`\sum_k c_k T_k'(u)` together.
+def _chebyshev_eval(u, coeff_ptr, degree: tl.constexpr):
+    r"""Evaluate :math:`\sum_k c_k T_k(u)` only -- no derivative.
 
-    Both the polynomial recurrence (:math:`T_k = 2uT_{k-1} - T_{k-2}`) and its
-    derivative recurrence (:math:`T_k' = kU_{k-1}`, :math:`U_k = 2uU_{k-1} -
-    U_{k-2}`) are advanced in lockstep across one Python-level loop over
-    ``range(degree + 1)`` -- unrolled at trace time since ``degree`` is a
-    ``tl.constexpr``, the same mechanism this file's ``BLOCK_CK`` loops
-    already rely on. This is the one genuinely new pattern relative to the
-    tanh kernel; see the module docstring's Tier 2 note.
+    Three of this file's four evaluation sites (the forward pass, and the
+    backward pass's two forward replays) discard the derivative, so computing
+    it there was pure waste: at :math:`N = 252` steps it ran the entire
+    :math:`U` recurrence per step and threw the result away.
+
+    Uses ``k`` for nothing but ``tl.load(coeff_ptr + k)``, which is legal with
+    a runtime offset -- the same pointer arithmetic the proven tanh kernel
+    does with ``tl.load(coeff_b_ptr + column)``. So this function contains no
+    construct that depends on ``k`` being a compile-time value.
 
     Args:
         u: Standardised coordinate tile.
-        coeff_ptr: Pointer to :math:`c_0, \dots, c_K` (contiguous, in the
-            packed params buffer).
+        coeff_ptr: Pointer to :math:`c_0, \dots, c_K`, contiguous.
+        degree: :math:`K`, a compile-time constant.
+
+    Returns:
+        ``spatial``, same shape as ``u``.
+    """
+    # "ones" shaped like `u` via elementwise arithmetic on `u` itself: this
+    # function is shape-agnostic, and Triton's zeros/ones constructors need an
+    # explicit compile-time shape rather than "like another tensor".
+    t_prev = 0.0 * u + 1.0  # T_0
+    spatial = tl.load(coeff_ptr + 0) * t_prev
+
+    if degree >= 1:
+        t_curr = u  # T_1
+        spatial = spatial + tl.load(coeff_ptr + 1) * t_curr
+
+        for k in range(2, degree + 1):
+            t_next = 2.0 * u * t_curr - t_prev
+            spatial = spatial + tl.load(coeff_ptr + k) * t_next
+            t_prev, t_curr = t_curr, t_next
+
+    return spatial
+
+
+@triton.jit
+def _chebyshev_eval_and_deriv(
+    u, coeff_ptr, deriv_coeff_ptr, degree: tl.constexpr
+):
+    r"""Evaluate :math:`\sum_k c_k T_k(u)` and its :math:`u`-derivative.
+
+    The derivative uses :math:`T_k'(u) = k\,U_{k-1}(u)` with :math:`U` the
+    Chebyshev polynomials of the second kind. The factor :math:`k` is **not
+    computed here**: the host passes :math:`\hat c_k = k\,c_k` in
+    ``deriv_coeff_ptr``, so the sum is :math:`\sum_k \hat c_k U_{k-1}(u)`
+    with no :math:`k` arithmetic in the kernel at all.
+
+    That matters for a concrete reason. ``for k in range(...)`` inside
+    ``@triton.jit`` does **not** unroll at trace time -- Triton lowers it to a
+    runtime loop and ``k`` becomes a ``tl.tensor``, so the original
+    ``float(k)`` raised ``TypeError: float() argument must be ... not
+    'tensor'`` on first compile. Folding :math:`k` into the coefficient
+    sidesteps the question entirely rather than relying on int-to-float
+    promotion, and removes one multiply per term. Verified on CPU against
+    :func:`src.models.vol_surface.chebyshev_basis_derivative`.
+
+    Args:
+        u: Standardised coordinate tile.
+        coeff_ptr: Pointer to :math:`c_0, \dots, c_K`, contiguous.
+        deriv_coeff_ptr: Pointer to :math:`0, 1c_1, 2c_2, \dots, Kc_K`.
         degree: :math:`K`, a compile-time constant.
 
     Returns:
         ``(spatial, d_spatial_du)``, same shape as ``u``.
     """
-    # T_0 = 1, T_0' = 0. Building "ones"/"zeros" shaped like `u` via
-    # elementwise arithmetic on `u` itself, since this function is
-    # shape-agnostic (called with a (BLOCK_M,) tile from both kernels above)
-    # and Triton's zeros/ones constructors need an explicit compile-time
-    # shape rather than "like another tensor".
     ones = 0.0 * u + 1.0
-    t_prev = ones
-    c0 = tl.load(coeff_ptr + 0)
-    spatial = c0 * t_prev
-    d_spatial_du = 0.0 * u
+    t_prev = ones  # T_0
+    spatial = tl.load(coeff_ptr + 0) * t_prev
+    d_spatial_du = 0.0 * u  # T_0' = 0
 
     if degree >= 1:
         t_curr = u  # T_1
-        c1 = tl.load(coeff_ptr + 1)
-        spatial = spatial + c1 * t_curr
+        spatial = spatial + tl.load(coeff_ptr + 1) * t_curr
 
         u_prev = ones  # U_0
-        d_spatial_du = d_spatial_du + c1 * (1.0 * u_prev)  # T_1' = 1 * U_0
+        # T_1' = 1 * U_0, and the 1 is already folded into deriv_coeff[1].
+        d_spatial_du = d_spatial_du + tl.load(deriv_coeff_ptr + 1) * u_prev
 
     if degree >= 2:
         u_curr = 2.0 * u  # U_1
         t_next = 2.0 * u * t_curr - t_prev  # T_2
-        c2 = tl.load(coeff_ptr + 2)
-        spatial = spatial + c2 * t_next
-        d_spatial_du = d_spatial_du + c2 * (2.0 * u_curr)  # T_2' = 2 * U_1
+        spatial = spatial + tl.load(coeff_ptr + 2) * t_next
+        # T_2' = 2 * U_1; the 2 is folded into deriv_coeff[2].
+        d_spatial_du = d_spatial_du + tl.load(deriv_coeff_ptr + 2) * u_curr
         t_prev, t_curr = t_curr, t_next
 
         for k in range(3, degree + 1):
             t_next = 2.0 * u * t_curr - t_prev
-            ck = tl.load(coeff_ptr + k)
-            spatial = spatial + ck * t_next
+            spatial = spatial + tl.load(coeff_ptr + k) * t_next
 
             u_next = 2.0 * u * u_curr - u_prev
-            d_spatial_du = d_spatial_du + ck * (float(k) * u_next)
+            d_spatial_du = (
+                d_spatial_du + tl.load(deriv_coeff_ptr + k) * u_next
+            )
 
             t_prev, t_curr = t_curr, t_next
             u_prev, u_curr = u_curr, u_next
@@ -715,7 +812,7 @@ def _fused_chebyshev_local_vol_forward_kernel(
                 z = tl.randn(program_seed, rng_offset).to(DTYPE)
 
                 u = (state - reference) / half_width
-                spatial, _ = _chebyshev_eval_and_deriv(u, coeff_ptr, DEGREE)
+                spatial = _chebyshev_eval(u, coeff_ptr, DEGREE)
                 sigma = tl.maximum(spatial, floor) + term * (step * dt)
 
                 advanced = (
@@ -752,6 +849,7 @@ def _fused_chebyshev_local_vol_forward_kernel(
 def _fused_chebyshev_local_vol_backward_kernel(
     params_ptr,
     coeff_ptr,
+    deriv_coeff_ptr,
     coeff_b_ptr,
     coeff_c_ptr,
     weight_ptr,
@@ -765,6 +863,7 @@ def _fused_chebyshev_local_vol_backward_kernel(
     n_steps,
     pc_stride_p,
     DEGREE: tl.constexpr,
+    BLOCK_DEG: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_CK: tl.constexpr,
     DTYPE: tl.constexpr,
@@ -783,6 +882,9 @@ def _fused_chebyshev_local_vol_backward_kernel(
     Args:
         params_ptr: Packed parameters, as in the forward kernel.
         coeff_ptr: Packed :math:`c_0, \dots, c_K`.
+        deriv_coeff_ptr: Packed :math:`0, 1c_1, \dots, Kc_K` -- the factor
+            :math:`k` folded in host-side, so no :math:`k` arithmetic happens
+            in the kernel (see :func:`_chebyshev_eval_and_deriv`).
         coeff_b_ptr: Affine coefficient :math:`B`.
         coeff_c_ptr: Affine coefficient :math:`C`.
         weight_ptr: :math:`\omega_k = \texttt{grad\_ee}_k / M`.
@@ -797,6 +899,8 @@ def _fused_chebyshev_local_vol_backward_kernel(
         n_steps: Number of time steps :math:`N`.
         pc_stride_p: Program-row stride of ``partial_coeff_ptr``.
         DEGREE: Chebyshev degree, compile-time.
+        BLOCK_DEG: Width of the coefficient axis, the next power of two at or
+            above ``DEGREE + 1`` (``tl.arange`` requires a power of two).
         BLOCK_M: Paths per tile. MUST equal the forward's value.
         BLOCK_CK: Segment length.
         DTYPE: Working element type.
@@ -825,9 +929,14 @@ def _fused_chebyshev_local_vol_backward_kernel(
     acc_s0 = zeros_m
     acc_drift = zeros_m
     acc_term = zeros_m
-    # One accumulator per coefficient. A Python list of tl.tensor built over a
-    # constexpr-length range -- see the module docstring's Tier 2 note.
-    acc_coeff = [zeros_m for _ in range(DEGREE + 1)]
+    # One accumulator column per coefficient, as a TILE rather than a Python
+    # list. `for k in range(...)` inside @triton.jit lowers to a runtime loop
+    # and `k` becomes a tl.tensor, so `acc_coeff[k]` would index a Python list
+    # with a tensor. Masked tile access is what the proven tanh kernel uses for
+    # precisely this reason (see its `checkpoints`/`replay` handling).
+    offs_deg = tl.arange(0, BLOCK_DEG)
+    deg_live = offs_deg < (DEGREE + 1)
+    acc_coeff = tl.zeros([BLOCK_M, BLOCK_DEG], dtype=DTYPE)
 
     for block_index in range(pid, n_blocks, n_programs):
         offs_m = block_index * BLOCK_M + local_m
@@ -847,7 +956,7 @@ def _fused_chebyshev_local_vol_backward_kernel(
                 rng_offset = (local_m * n_columns + step).to(tl.int32)
                 z = tl.randn(program_seed, rng_offset).to(DTYPE)
                 u = (state - reference) / half_width
-                spatial, _ = _chebyshev_eval_and_deriv(u, coeff_ptr, DEGREE)
+                spatial = _chebyshev_eval(u, coeff_ptr, DEGREE)
                 sigma = tl.maximum(spatial, floor) + term * (step * dt)
                 advanced = (
                     state
@@ -882,7 +991,7 @@ def _fused_chebyshev_local_vol_backward_kernel(
                 rng_offset = (local_m * n_columns + step).to(tl.int32)
                 z = tl.randn(program_seed, rng_offset).to(DTYPE)
                 u = (state - reference) / half_width
-                spatial, _ = _chebyshev_eval_and_deriv(u, coeff_ptr, DEGREE)
+                spatial = _chebyshev_eval(u, coeff_ptr, DEGREE)
                 sigma = tl.maximum(spatial, floor) + term * (step * dt)
                 advanced = (
                     state
@@ -904,7 +1013,7 @@ def _fused_chebyshev_local_vol_backward_kernel(
 
                 u = (state_k - reference) / half_width
                 spatial, d_spatial_du = _chebyshev_eval_and_deriv(
-                    u, coeff_ptr, DEGREE
+                    u, coeff_ptr, deriv_coeff_ptr, DEGREE
                 )
                 active_floor = spatial > floor
                 sigma = tl.maximum(spatial, floor) + term * (step * dt)
@@ -919,29 +1028,33 @@ def _fused_chebyshev_local_vol_backward_kernel(
                     gate, adjoint * vol_factor * (step * dt), zeros_m
                 )
 
-                # d_sigma/d_c_k = T_k(u) where the floor does not bind. Each
-                # T_k is recomputed via the same recurrence used for the
-                # value, one coefficient at a time, to avoid holding a
-                # (DEGREE+1, BLOCK_M) tile alive across the whole loop body.
-                t_prev = 1.0 + 0.0 * u
-                acc_coeff[0] = acc_coeff[0] + tl.where(
-                    gate, adjoint * vol_factor * tl.where(active_floor, t_prev, 0.0 * u), zeros_m
+                # d_sigma/d_c_k = T_k(u) wherever the floor does not bind.
+                # Build the whole T_k basis into a (BLOCK_M, BLOCK_DEG) tile by
+                # masked write -- column k receives T_k -- then accumulate every
+                # coefficient's contribution in one vectorised update.
+                basis_tile = tl.zeros([BLOCK_M, BLOCK_DEG], dtype=DTYPE)
+                t_prev = 0.0 * u + 1.0  # T_0
+                basis_tile = tl.where(
+                    offs_deg[None, :] == 0, t_prev[:, None], basis_tile
                 )
                 if DEGREE >= 1:
-                    t_curr = u
-                    acc_coeff[1] = acc_coeff[1] + tl.where(
-                        gate,
-                        adjoint * vol_factor * tl.where(active_floor, t_curr, 0.0 * u),
-                        zeros_m,
+                    t_curr = u  # T_1
+                    basis_tile = tl.where(
+                        offs_deg[None, :] == 1, t_curr[:, None], basis_tile
                     )
                     for k in range(2, DEGREE + 1):
                         t_next = 2.0 * u * t_curr - t_prev
-                        acc_coeff[k] = acc_coeff[k] + tl.where(
-                            gate,
-                            adjoint * vol_factor * tl.where(active_floor, t_next, 0.0 * u),
-                            zeros_m,
+                        basis_tile = tl.where(
+                            offs_deg[None, :] == k, t_next[:, None], basis_tile
                         )
                         t_prev, t_curr = t_curr, t_next
+
+                # The floor gate and the path gate are scalars per path, so
+                # they factor out of the degree axis entirely.
+                coeff_weight = tl.where(
+                    gate & active_floor, adjoint * vol_factor, zeros_m
+                )
+                acc_coeff = acc_coeff + coeff_weight[:, None] * basis_tile
 
                 jacobian = 1.0 + d_sigma_dx * vol_factor
                 weight_k = tl.load(weight_ptr + step, mask=live, other=0.0)
@@ -961,11 +1074,11 @@ def _fused_chebyshev_local_vol_backward_kernel(
     tl.store(partial_s0_ptr + pid, tl.sum(acc_s0, axis=0))
     tl.store(partial_drift_ptr + pid, tl.sum(acc_drift, axis=0))
     tl.store(partial_term_ptr + pid, tl.sum(acc_term, axis=0))
-    for k in range(DEGREE + 1):
-        tl.store(
-            partial_coeff_ptr + pid.to(tl.int64) * pc_stride_p + k,
-            tl.sum(acc_coeff[k], axis=0),
-        )
+    tl.store(
+        partial_coeff_ptr + pid.to(tl.int64) * pc_stride_p + offs_deg,
+        tl.sum(acc_coeff, axis=0),
+        mask=deg_live,
+    )
 
 
 # ==========================================================================
@@ -1018,7 +1131,7 @@ class FusedChebyshevLocalVolCVAFunction(torch.autograd.Function):
             )
 
         block_m, block_ck = select_chebyshev_local_vol_blocks(
-            n_steps, coeff_b.element_size()
+            n_steps, coeff_b.element_size(), degree
         )
         validate_offset_scheme(block_m, n_columns)
 
@@ -1080,12 +1193,23 @@ class FusedChebyshevLocalVolCVAFunction(torch.autograd.Function):
         )
         dtype_tl = tl.float64 if dtype == torch.float64 else tl.float32
 
+        # d_sigma/d_u needs T_k'(u) = k * U_{k-1}(u). Folding the factor k
+        # into the coefficient here means the kernel never does arithmetic on
+        # its loop index -- which inside @triton.jit is a runtime tensor, not
+        # a Python int (the original `float(k)` failed on exactly this).
+        orders = torch.arange(
+            degree + 1, device=device, dtype=dtype
+        )
+        deriv_coefficients = (orders * packed_coefficients).contiguous()
+
         _fused_chebyshev_local_vol_backward_kernel[(n_programs,)](
-            params, packed_coefficients, coeff_b, coeff_c, weight,
+            params, packed_coefficients, deriv_coefficients,
+            coeff_b, coeff_c, weight,
             partial_s0, partial_drift, partial_coeff, partial_term,
             ctx.seed, ctx.n_paths, ctx.n_columns, ctx.n_steps,
             partial_coeff.stride(0),
-            DEGREE=degree, BLOCK_M=ctx.block_m, BLOCK_CK=ctx.block_ck,
+            DEGREE=degree, BLOCK_DEG=chebyshev_block_degree(degree),
+            BLOCK_M=ctx.block_m, BLOCK_CK=ctx.block_ck,
             DTYPE=dtype_tl,
         )
 

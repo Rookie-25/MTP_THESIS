@@ -779,6 +779,75 @@ illustrates a model property and must render identically with or without a
 GPU present. `.cpu()` was also added before every `.numpy()` call as
 defense-in-depth, in case a future change reintroduces a CUDA tensor upstream.
 
+### Chebyshev kernel — FIRST COMPILE on T4, two bugs found and fixed
+
+The GPU tier ran for the first time on Colab (Tesla T4, Triton 3.6.0) and
+surfaced exactly the class of bug the two-tier split exists to isolate. Both
+are fixed; local suite is now **569 passing**.
+
+**Bug 1 — `for k in range(...)` inside `@triton.jit` does NOT unroll.**
+The kernel assumed a `tl.constexpr` bound makes the loop index a Python
+`int` at trace time. It does not: Triton lowers `range` to a *runtime* loop
+and `k` becomes a `tl.tensor`. Only `tl.static_range` unrolls. Two failures
+followed from the one misconception:
+
+- `float(k)` -> `TypeError: float() argument must be a string or a real
+  number, not 'tensor'` (the reported compile error);
+- `acc_coeff[k]`, a Python list of per-coefficient accumulators indexed by
+  the loop variable, would have failed identically the moment the forward
+  compiled. The module docstring had flagged this pattern as the top risk but
+  gave the **wrong reason** ("unrolled into a separate SSA value at trace
+  time"); that claim is now corrected in place rather than left standing.
+
+Fixed without `tl.static_range` — unverifiable from the dev machine, and this
+project already lost a round trip to assuming `tl.math.tanh` existed:
+
+1. **Split the device function.** Three of four call sites discard the
+   derivative, so `_chebyshev_eval` (value only) now serves them. It uses `k`
+   for nothing but `tl.load(coeff_ptr + k)`, which is legal with a runtime
+   offset. Side benefit: the forward had been running the entire `U`
+   recurrence and throwing it away at all 252 steps.
+2. **Folded `k` into the coefficients host-side.** Since
+   `d/du sum_k c_k T_k(u) = sum_k (k*c_k) U_{k-1}(u)`, the host passes
+   `dc_k = k*c_k` and the kernel does no `k` arithmetic at all. Verified on
+   CPU against `chebyshev_basis_derivative` across degrees 0-14.
+3. **Replaced the accumulator list with a masked `(BLOCK_M, BLOCK_DEG)`
+   tile**, accumulated vectorised and written with one masked `tl.store`.
+   This is precisely the pattern the proven tanh kernel already uses for its
+   `checkpoints`/`replay` tiles, and for the same reason. `BLOCK_DEG` is the
+   next power of two at or above `degree+1` (`tl.arange` requires one), with
+   the tail masked; padding columns verified to stay exactly zero.
+   `select_chebyshev_local_vol_blocks` now budgets for the two extra tiles,
+   so `BLOCK_M` drops 64 -> 32 at float64/degree-8 rather than silently
+   costing occupancy.
+
+All three rewritten pieces were checked by a **line-for-line Python mirror**
+against the verified basis functions before being trusted in code that cannot
+be compiled locally: value-only exact (0.0), derivative and accumulator at
+float64 recurrence noise, padding columns exactly zero.
+
+**Bug 2 — a pytest version trap of my own making.** A class-scoped fixture
+defined as an instance method is deprecated in pytest 10, and the workaround
+I used (`@classmethod` stacked over `@pytest.fixture`) is silently
+version-dependent: pytest 9.1.1 (dev machine) unwraps the descriptor to find
+the fixture marker, pytest 8.4.2 (Colab) does not and reports
+`fixture 'local_vol' not found`. So a warning that only the *newer* pytest
+emits was silenced in a way that broke the *older* one — invisible locally.
+Replaced with a plain module-level fixture: no descriptor, same caching,
+identical behaviour on every pytest version.
+
+**New regression guards (`TestRuntimeLoopVariableGuards`).** Neither bug is
+catchable by running anything without a GPU, so they are now *static source
+checks* over the AST of every `@triton.jit` function: no `float(...)` call,
+and no Python container subscripted by a `for`-loop target. Same rationale
+and precedent as `tests/test_phase4.py::TestGlobalPointerAddressing`, which
+guards the int64 pointer fix the same way. A meta-test asserts the guards
+actually find the kernels, so an import rename cannot silently empty them.
+
+**Still unverified:** the corrected kernel has not been compiled either. The
+fixes remove every construct identifiable as version- or semantics-dependent,
+but a second first-contact failure remains possible.
+
 ### Chebyshev local-vol kernel — fixes the tanh kernel's wing saturation
 
 `src/models/vol_surface.py` (`chebyshev_basis`, `chebyshev_basis_derivative`,
