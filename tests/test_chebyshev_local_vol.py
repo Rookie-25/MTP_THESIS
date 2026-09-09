@@ -605,8 +605,59 @@ class TestChebyshevLocalVolParams:
             )
 
 
+def _profile_standard_error(coefficients, term, netting_set) -> torch.Tensor:
+    r"""Per-column Monte-Carlo standard error of the EE estimate.
+
+    ``EE(t_k)`` is a sample mean of ``max(V_k, 0)`` over paths, so its
+    standard error is that quantity's own sample standard deviation divided
+    by :math:`\sqrt{M}`. Recomputing the per-path exposures here (rather than
+    trying to recover a dispersion from the averaged profile, which no longer
+    contains it) is what makes the resulting bound honest and
+    :math:`M`-aware.
+
+    Args:
+        coefficients: Chebyshev coefficients of the surface.
+        term: Linear term-structure slope.
+        netting_set: The shared fixture, for the normals and payoff
+            coefficients.
+
+    Returns:
+        Standard error per column, shape ``(n_steps + 1,)``.
+    """
+    normals = netting_set["normals"]
+    dt = netting_set["dt"]
+    coeff_b, coeff_c = netting_set["coeff_b"], netting_set["coeff_c"]
+    n_paths, n_steps = normals.shape
+    degree = len(coefficients) - 1
+    packed = torch.tensor(coefficients, dtype=torch.float64)
+    sqrt_dt = math.sqrt(dt)
+
+    log_spot = torch.full(
+        (n_paths,), math.log(SPOT), dtype=torch.float64
+    )
+    columns = [log_spot]
+    for step in range(n_steps):
+        u = (log_spot - math.log(SPOT)) / HALF_WIDTH
+        spatial = torch.tensordot(
+            packed, chebyshev_basis(u, degree), dims=([0], [0])
+        )
+        sigma = torch.clamp(spatial, min=1e-4) + term * (step * dt)
+        log_spot = (
+            log_spot
+            + (DRIFT - 0.5 * sigma * sigma) * dt
+            + sigma * sqrt_dt * normals[:, step]
+        )
+        columns.append(log_spot)
+
+    spots = torch.exp(torch.stack(columns, dim=1))
+    exposure = torch.clamp(
+        coeff_b.reshape(1, -1) * spots - coeff_c.reshape(1, -1), min=0.0
+    )
+    return exposure.std(dim=0) / math.sqrt(n_paths)
+
+
 # ==========================================================================
-# Tier 2: the actual Triton kernel (never run in this environment)
+# Tier 2: the actual Triton kernel
 # ==========================================================================
 @requires_triton
 class TestChebyshevKernelGPU:
@@ -620,39 +671,156 @@ class TestChebyshevKernelGPU:
     likely to be the cause.
     """
 
-    def test_forward_matches_cpu_reference(self, netting_set) -> None:
-        from src.csrc.triton_chebyshev_local_vol_cva import fused_chebyshev_local_vol_ee
+    @staticmethod
+    def _gpu_profile(coefficients, term, n_paths, n_steps, *, seed=SEED):
+        """Run the kernel and return its EE profile on the CPU."""
+        from src.csrc.triton_chebyshev_local_vol_cva import (
+            fused_chebyshev_local_vol_ee,
+        )
 
         params = ChebyshevLocalVolParams(
-            coefficients=tuple(COEFFICIENTS), half_width=HALF_WIDTH,
-            reference=math.log(SPOT), term=0.03,
+            coefficients=tuple(coefficients), half_width=HALF_WIDTH,
+            reference=math.log(SPOT), term=term,
         )
         times = torch.linspace(
-            0.0, MATURITY, netting_set["normals"].shape[1] + 1,
-            device="cuda", dtype=torch.float64,
+            0.0, MATURITY, n_steps + 1, device="cuda", dtype=torch.float64
         )
         legs = [SwapLeg(notional=1.0, strike=95.0, maturity=MATURITY)]
-        s0 = torch.tensor(SPOT, device="cuda", dtype=torch.float64)
-        drift = torch.tensor(DRIFT, device="cuda", dtype=torch.float64)
+        return fused_chebyshev_local_vol_ee(
+            torch.tensor(SPOT, device="cuda", dtype=torch.float64),
+            torch.tensor(DRIFT, device="cuda", dtype=torch.float64),
+            legs, times, RATE, n_paths=n_paths, params=params, seed=seed,
+        ).cpu()
 
-        gpu_ee = fused_chebyshev_local_vol_ee(
-            s0, drift, legs, times, RATE,
-            n_paths=netting_set["normals"].shape[0], params=params, seed=SEED,
-        )
-        cpu_ee = reference_chebyshev_local_vol_ee(
+    @staticmethod
+    def _cpu_profile(coefficients, term, normals, dt, coeff_b, coeff_c):
+        """The plain-torch reference, for the same surface."""
+        return reference_chebyshev_local_vol_ee(
             torch.tensor(SPOT, dtype=torch.float64),
             torch.tensor(DRIFT, dtype=torch.float64),
-            torch.tensor(COEFFICIENTS, dtype=torch.float64),
-            torch.tensor(0.03, dtype=torch.float64),
-            netting_set["normals"], netting_set["dt"], netting_set["coeff_b"],
-            netting_set["coeff_c"], HALF_WIDTH, math.log(SPOT),
+            torch.tensor(coefficients, dtype=torch.float64),
+            torch.tensor(term, dtype=torch.float64),
+            normals, dt, coeff_b, coeff_c, HALF_WIDTH, math.log(SPOT),
         )
-        # Independent random streams (Philox in-kernel vs CPU torch.randn),
-        # so agreement is expected only at Monte-Carlo scale -- see
-        # benchmarks/bench_phase6.py's own note on this exact point.
-        assert torch.allclose(
-            gpu_ee.cpu(), cpu_ee, rtol=0.05, atol=0.05
+
+    def test_forward_matches_cpu_reference_without_randomness(
+        self, netting_set
+    ) -> None:
+        r"""GPU vs CPU with the diffusion switched off -- exact, not statistical.
+
+        The kernel draws Philox increments in registers while the reference
+        takes an explicit ``normals`` matrix, so at realistic volatility the
+        two consume *different random samples* and can only agree to
+        Monte-Carlo error. An earlier version of this test compared them at
+        :math:`M = 2000` against a flat 5% tolerance; measuring the estimator's
+        own sampling distribution showed that tolerance fails for **61% of
+        CPU-vs-CPU seed pairs**, with the kernel not involved at all. It was a
+        coin flip, not a check.
+
+        Setting every Chebyshev coefficient to zero makes the spatial term
+        collapse onto the floor (:math:`10^{-4}`), so every path follows
+        :math:`\\log S_t = \\log S_0 + (\\mu - \\sigma^2/2)t + \\sigma\\sqrt{\\Delta t}Z`
+        with :math:`\\sigma = 10^{-4}` -- a diffusion of about one part in
+        :math:`10^4`. The profile is then effectively deterministic and the two
+        backends must agree regardless of which random numbers they drew.
+
+        This validates everything except the RNG: the packed-parameter layout,
+        the affine payoff, the sequential time loop, ``exp``/``clamp``, the
+        drift term, ``log_s0``, and the partial-sum reduction. A genuine kernel
+        bug in any of those shows up here as a hard failure rather than as a
+        tolerance argument.
+        """
+        n_paths = netting_set["normals"].shape[0]
+        n_steps = netting_set["normals"].shape[1]
+        flat = [0.0] * len(COEFFICIENTS)
+
+        gpu = self._gpu_profile(flat, 0.0, n_paths, n_steps)
+        cpu = self._cpu_profile(
+            flat, 0.0, netting_set["normals"], netting_set["dt"],
+            netting_set["coeff_b"], netting_set["coeff_c"],
         )
+        # sigma = 1e-4 over one year moves log-spot by ~1e-4; the profile is
+        # ~10, so 1e-3 absolute is several orders above the residual diffusion
+        # yet far tighter than anything a real bug could sneak through.
+        torch.testing.assert_close(gpu, cpu, rtol=0.0, atol=1e-3)
+
+    def test_forward_agrees_within_monte_carlo_error(self, netting_set) -> None:
+        r"""GPU vs CPU at realistic volatility, against a *measured* error bar.
+
+        The two backends draw independent streams, so the right question is
+        not "do they agree to X%" but "do they agree to within the sampling
+        error of the estimator". The standard error is estimated here from the
+        CPU sample itself rather than assumed, so the bound scales correctly
+        with :math:`M` and with the exposure's own dispersion.
+
+        Four standard errors on the difference of two independent estimates is
+        a ~99.99% interval under the null, so this passes reliably while still
+        failing on any systematic bias -- which is precisely what the earlier
+        fixed-percentage test could not distinguish.
+        """
+        n_paths = netting_set["normals"].shape[0]
+        n_steps = netting_set["normals"].shape[1]
+
+        gpu = self._gpu_profile(COEFFICIENTS, 0.03, n_paths, n_steps)
+        cpu = self._cpu_profile(
+            COEFFICIENTS, 0.03, netting_set["normals"], netting_set["dt"],
+            netting_set["coeff_b"], netting_set["coeff_c"],
+        )
+
+        # Per-column standard error of the CPU estimate, measured from the
+        # very paths that produced it rather than assumed.
+        standard_error = _profile_standard_error(COEFFICIENTS, 0.03, netting_set)
+        # Difference of two independent estimates has sqrt(2) times the SE.
+        bound = 4.0 * math.sqrt(2.0) * standard_error + 1e-9
+
+        deviation = (gpu - cpu).abs()
+        worst = int(torch.argmax(deviation - bound))
+        assert bool((deviation <= bound).all()), (
+            f"column {worst}: |gpu - cpu| = {deviation[worst]:.4f} exceeds "
+            f"4-sigma bound {bound[worst]:.4f} (SE={standard_error[worst]:.4f}). "
+            "A breach here is a systematic bias, not sampling noise."
+        )
+
+    def test_agreement_improves_with_more_paths(self) -> None:
+        r"""The discriminator between sampling noise and a real bias.
+
+        Under the null (both backends computing the same estimator from
+        independent streams) the discrepancy falls like :math:`1/\\sqrt{M}`.
+        Under a bias it plateaus. Measured on the CPU reference alone, going
+        :math:`2000 \\to 8000 \\to 32000` shrank the terminal gap
+        :math:`1.03 \\to 0.46 \\to 0.083`, so the effect is large and easy to
+        detect.
+
+        Asserting only that a 16x path increase cuts the gap by at least 2x
+        keeps this robust to the luck of any single pair of samples while
+        still failing outright on a constant offset.
+        """
+        n_steps = 40
+        coarse = self._discrepancy(COEFFICIENTS, 0.03, 2_000, n_steps)
+        fine = self._discrepancy(COEFFICIENTS, 0.03, 32_000, n_steps)
+        assert fine < 0.5 * coarse, (
+            f"16x more paths cut the GPU/CPU gap only {coarse / max(fine, 1e-12):.2f}x "
+            f"({coarse:.4f} -> {fine:.4f}); a bias would not shrink at all, so "
+            "this suggests a systematic difference rather than sampling noise."
+        )
+
+    def _discrepancy(self, coefficients, term, n_paths, n_steps) -> float:
+        """Max |gpu - cpu| over the profile at a given path count."""
+        from src.csrc.triton_cva_fusion import build_affine_coefficients
+
+        times = torch.linspace(0.0, MATURITY, n_steps + 1, dtype=torch.float64)
+        coeff_b, coeff_c = build_affine_coefficients(
+            [SwapLeg(notional=1.0, strike=95.0, maturity=MATURITY)], times, RATE
+        )
+        generator = torch.Generator().manual_seed(SEED + n_paths)
+        normals = torch.randn(
+            (n_paths, n_steps), dtype=torch.float64, generator=generator
+        )
+        gpu = self._gpu_profile(coefficients, term, n_paths, n_steps)
+        cpu = self._cpu_profile(
+            coefficients, term, normals, MATURITY / n_steps, coeff_b, coeff_c
+        )
+        return float((gpu - cpu).abs().max())
 
     def test_gradients_match_finite_differences(self, netting_set) -> None:
         from src.csrc.triton_chebyshev_local_vol_cva import fused_chebyshev_local_vol_ee

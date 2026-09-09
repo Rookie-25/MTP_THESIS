@@ -95,10 +95,17 @@ SURFACE = "#ffffff"
 #: Colour follows the entity, so order is fixed across every figure; a
 #: backend missing from one run must not repaint the others.
 BACKEND_STYLE_BY_PREFIX: Tuple[Tuple[str, Tuple[str, str, str]], ...] = (
+    # Longest / most specific prefixes first: "PyTorch autograd" must be
+    # matched before the bare "PyTorch" family, and both baselines share the
+    # blue slot because they play the same role in their respective figures.
+    ("PyTorch autograd", ("#2a78d6", "-", "o")),
     ("PyTorch baseline", ("#2a78d6", "-", "o")),
     ("Phase 3", ("#eb6834", "--", "s")),
     ("Phase 4", ("#1baf7a", "-.", "^")),
     ("Phase 5", ("#4a3aa7", ":", "D")),
+    # bench_phase6.py's kernel column. Same violet as Phase 5 -- they never
+    # appear in the same figure, and both are "the fused kernel" in theirs.
+    ("Phase 6", ("#4a3aa7", ":", "D")),
 )
 FALLBACK_STYLE = (INK_SECONDARY, "-", "v")
 
