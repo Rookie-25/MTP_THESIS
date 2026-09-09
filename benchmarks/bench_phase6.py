@@ -141,13 +141,24 @@ BASELINE = "PyTorch autograd"
 KERNEL = "Phase 6 Triton"
 BACKENDS = (BASELINE, KERNEL)
 
-#: Rough count of (M,) tensors the autograd tape retains per time step in
-#: ``reference_local_vol_ee`` (tanh output, sigma, the squared term, the
-#: increment, the new state), plus the stacked/exponentiated/clamped
-#: (M, N+1) surfaces. Used only for the pre-flight refusal, so it is
-#: deliberately an under-estimate: erring low means attempting a run that
-#: might fail rather than refusing one that would have succeeded.
-BASELINE_TAPE_TENSORS_PER_STEP = 8
+#: Count of (M,) tensors the autograd tape retains per time step in
+#: ``reference_local_vol_ee``, **measured** rather than estimated.
+#:
+#: The original value here was a guess of 8 (tanh output, sigma, the squared
+#: term, the increment, the new state, plus slack). The first full T4 sweep
+#: contradicted it: the tape is 0.304 GiB at M=1e5 and 3.130 GiB at M=1e6,
+#: against a one-(M, N+1)-tensor size of 0.094 / 0.942 GiB -- i.e. **3.23 and
+#: 3.32** tensor-equivalents per step, consistent across a 10x path range.
+#:
+#: Correcting this matters beyond tidiness. Overestimating the tape makes the
+#: pre-flight guard refuse configurations the baseline could actually
+#: complete, which understates the competitor and flatters this project's own
+#: kernel: at 8 the implied baseline ceiling is ~1.16M paths, where the
+#: measured ceiling is ~1.66M. Erring slightly high (3.5 vs 3.32) keeps a
+#: small margin while staying honest; an actual OOM is caught and recorded by
+#: :func:`measure_backend` anyway, so a marginal under-prediction degrades
+#: gracefully.
+BASELINE_TAPE_TENSORS_PER_STEP = 3.5
 
 
 def portfolio() -> List[SwapLeg]:

@@ -984,44 +984,51 @@ written:
   moment Triton is available; they compare the compiled kernel against the
   CPU reference and against finite differences.
 
-### Phase 6 benchmark — MEASURED on a Tesla T4 (partial sweep)
+### Phase 6 benchmark — COMPLETE on a Tesla T4
 
-`benchmarks/bench_phase6.py` ran for the first time. Local-volatility AAD,
-Triton kernel vs PyTorch autograd, N=252, float32, min of 3 repeats:
+`benchmarks/bench_phase6.py`, full sweep. Local-volatility AAD, Triton kernel
+vs PyTorch autograd, N=252, float32, min of 3 repeats. **This is the Phase 6
+headline result.**
 
 | M | fwd baseline | fwd kernel | speedup | bwd baseline | bwd kernel | speedup |
 |---|---|---|---|---|---|---|
-| 10,000 | 47.9 ms | 1.8 ms | **26.6x** | 68.3 ms | 5.3 ms | **12.8x** |
-| 100,000 | 85.7 ms | 3.9 ms | **21.9x** | 69.2 ms | 18.4 ms | **3.8x** |
+| 10,000 | 47.6 ms | 1.7 ms | **27.3x** | 70.4 ms | 5.2 ms | **13.5x** |
+| 100,000 | 88.5 ms | 4.0 ms | **22.0x** | 68.8 ms | 18.9 ms | **3.7x** |
+| 1,000,000 | 655.2 ms | 36.1 ms | **18.1x** | 441.4 ms | 233.0 ms | **1.9x** |
+| 5,000,000 | **OOM** | 206.7 ms | -- | **OOM** | 1,171.6 ms | -- |
 
 | M | baseline fwd | baseline fwd+bwd | kernel fwd | kernel fwd+bwd | saving |
 |---|---|---|---|---|---|
 | 10,000 | 50.1 MiB | 81.2 MiB | 0.3 MiB | 0.3 MiB | **261x** |
 | 100,000 | 483.4 MiB | 795.0 MiB | 3.0 MiB | 3.0 MiB | **263x** |
+| 1,000,000 | 4.77 GiB | 7.90 GiB | 4.3 MiB | 4.3 MiB | **1,895x** |
+| 5,000,000 | **OOM** | **OOM** | 4.3 MiB | 4.3 MiB | -- |
 
-The kernel's peak is identical for forward and forward+backward at both path
-counts — the checkpointed adjoint genuinely adds no `O(M*N)` term, which is
-the property Phase 6 exists to demonstrate.
+Two results worth stating separately:
 
-**INCOMPLETE: the sweep stopped at M=100,000, so the OOM cliff was not
-reached.** The report says so itself ("Both backends completed every stage at
-every path count in this sweep"). The headline Phase 6 claim — the autograd
-tape running out of memory where the kernel is still flat — is therefore
-still unmeasured.
+1. **The kernel's forward and forward+backward peaks are identical at every
+   path count** (0.3 / 3.0 / 4.3 MiB). The checkpointed adjoint adds no
+   `O(M*N)` term whatsoever -- which is the property sqrt(N) checkpointing
+   exists to deliver, shown directly rather than argued.
+2. **At M=5,000,000 the baseline cannot run at all** while the kernel
+   completes both passes in 1,378 ms at 4.3 MiB. That is the qualitative
+   claim: not "faster", but "possible at all".
 
-Extrapolating from the *measured* numbers (not the earlier estimate, which
-was pessimistic — the real tape is ~3.2 `(M,N)`-tensor-equivalents per step,
-not 8):
+The speed advantage narrows with M (27x -> 18x forward, 13.5x -> 1.9x
+backward) because the PyTorch baseline amortises its launch overhead as the
+problem grows. The **memory** advantage widens instead (261x -> 1,895x), and
+that is the claim to lead with -- it is structural, not a constant factor.
 
-| M | baseline fwd | baseline fwd+bwd | fits a 14.6 GiB T4? |
-|---|---|---|---|
-| 1,000,000 | 4.72 GiB | 7.76 GiB | yes |
-| 2,000,000 | 9.44 GiB | 15.53 GiB | **no** |
-| 5,000,000 | 23.60 GiB | 38.82 GiB | **no** |
-
-So the cliff sits between 1e6 and 2e6. Running
-`--paths 10000 100000 1000000 5000000` will show the baseline completing at
-1e6 and being refused at 5e6 while the kernel stays at ~4 MiB.
+**Corrected while writing this up:** `BASELINE_TAPE_TENSORS_PER_STEP` was a
+guess of 8. The measured tape is 0.304 GiB at M=1e5 and 3.130 GiB at M=1e6
+against one-tensor sizes of 0.094 / 0.942 GiB, i.e. **3.23 and 3.32**
+tensor-equivalents per step -- consistent across a 10x path range. The guess
+was 2.4x too high, which made the pre-flight guard refuse configurations the
+baseline could actually complete: implied ceiling ~1.16M paths against a true
+~1.66M. That error understated the competitor and flattered this project's
+own kernel, so it is fixed (constant now 3.5, just above measurement).
+Predictions now track reality: 7.05 GiB predicted vs 7.90 GiB measured at
+M=1e6.
 
 ### Phase 6 benchmark — design notes (results are in the section above)
 
